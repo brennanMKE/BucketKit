@@ -83,6 +83,8 @@ extension BucketClient {
                 Self.logger.debug("uploadData finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
             } catch is CancellationError {
                 await state.cancel()
+            } catch let urlError as URLError {
+                await state.fail(with: BucketClientError.transport(urlError))
             } catch {
                 await state.fail(with: error)
             }
@@ -181,6 +183,8 @@ extension BucketClient {
                 Self.logger.debug("uploadFile finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
             } catch is CancellationError {
                 await state.cancel()
+            } catch let urlError as URLError {
+                await state.fail(with: BucketClientError.transport(urlError))
             } catch {
                 await state.fail(with: error)
             }
@@ -294,7 +298,9 @@ extension BucketClient {
     ) throws -> URL {
         let endpoint = configuration.endpoint
         guard let scheme = endpoint.scheme, let host = endpoint.host else {
-            throw UploadError.invalidEndpoint(endpoint)
+            throw BucketClientError.invalidConfiguration(
+                "endpoint missing scheme or host: \(endpoint.absoluteString)"
+            )
         }
 
         // Encode the key as a sequence of `/`-separated segments so
@@ -323,13 +329,15 @@ extension BucketClient {
         }
 
         guard let url = components.url else {
-            throw UploadError.invalidEndpoint(endpoint)
+            throw BucketClientError.invalidConfiguration(
+                "could not build object URL from endpoint: \(endpoint.absoluteString)"
+            )
         }
         return url
     }
 
     /// Builds the public ``UploadResult`` from a successful HTTP
-    /// response. Throws ``UploadError/badStatus`` on non-2xx.
+    /// response. Throws a decoded ``BucketServiceError`` on non-2xx.
     private static func makeUploadResult(
         key: String,
         response: HTTPURLResponse,
@@ -337,8 +345,7 @@ extension BucketClient {
     ) throws -> UploadResult {
         let status = response.statusCode
         guard (200..<300).contains(status) else {
-            // TODO: replace with BucketServiceError after #0015.
-            throw UploadError.badStatus(status: status, body: body)
+            throw BucketServiceError.decode(httpStatus: status, body: body)
         }
         let rawETag = (response.value(forHTTPHeaderField: "ETag")
             ?? response.value(forHTTPHeaderField: "Etag")
@@ -363,16 +370,3 @@ extension BucketClient {
     }
 }
 
-// TODO: replace with BucketServiceError after #0015.
-fileprivate struct UploadError: Error {
-    let status: Int
-    let body: Data
-
-    static func badStatus(status: Int, body: Data) -> UploadError {
-        UploadError(status: status, body: body)
-    }
-
-    static func invalidEndpoint(_ url: URL) -> UploadError {
-        UploadError(status: -1, body: Data(url.absoluteString.utf8))
-    }
-}

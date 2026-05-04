@@ -12,9 +12,9 @@ extension BucketClient {
     ///
     /// On success (HTTP 204 No Content or 200) the resolved key is
     /// returned so callers can correlate the delete with the path
-    /// they passed in. On any non-2xx the placeholder error is
-    /// thrown today; #0015 will replace it with a typed
-    /// ``BucketServiceError``.
+    /// they passed in. On any non-2xx a typed
+    /// ``BucketServiceError`` decoded from the response body is
+    /// thrown.
     ///
     /// - Parameters:
     ///   - bucket: Bucket name.
@@ -26,42 +26,47 @@ extension BucketClient {
         path: any BucketPath,
         options: RemoveOptions = .init()
     ) async throws -> String {
-        try Task.checkCancellation()
+        do {
+            try Task.checkCancellation()
 
-        let key = path.resolve()
-        Self.removeLogger.debug("remove start key=\(key, privacy: .public) versionID=\(options.versionID ?? "-", privacy: .public)")
+            let key = path.resolve()
+            Self.removeLogger.debug("remove start key=\(key, privacy: .public) versionID=\(options.versionID ?? "-", privacy: .public)")
 
-        let request = try Self.buildSignedDeleteRequest(
-            bucket: bucket,
-            key: key,
-            configuration: configuration,
-            versionID: options.versionID
-        )
+            let request = try Self.buildSignedDeleteRequest(
+                bucket: bucket,
+                key: key,
+                configuration: configuration,
+                versionID: options.versionID
+            )
 
-        try Task.checkCancellation()
+            try Task.checkCancellation()
 
-        let (responseBody, response) = try await transport.send(request, body: nil)
+            let (responseBody, response) = try await transport.send(request, body: nil)
 
-        try Task.checkCancellation()
+            try Task.checkCancellation()
 
-        let status = response.statusCode
-        guard status == 204 || status == 200 else {
-            // TODO: replace with BucketServiceError after #0015.
-            throw RemoveError.badStatus(status: status, body: responseBody)
+            let status = response.statusCode
+            guard status == 204 || status == 200 else {
+                throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+            }
+
+            Self.removeLogger.debug("remove finish key=\(key, privacy: .public) status=\(status, privacy: .public)")
+            return key
+        } catch is CancellationError {
+            throw BucketClientError.cancelled
+        } catch let urlError as URLError {
+            throw BucketClientError.transport(urlError)
         }
-
-        Self.removeLogger.debug("remove finish key=\(key, privacy: .public) status=\(status, privacy: .public)")
-        return key
     }
 
     /// Fetches metadata for an object without transferring the body.
     ///
     /// Issues a `HEAD` against `bucket`/`key` and parses the response
-    /// headers into an ``ObjectMetadata`` value. On any non-2xx the
-    /// placeholder error is thrown — note that S3's HEAD responses
-    /// have an empty body even on errors (no XML error document), so
-    /// the typed mapping in #0015 will rely on the status code and
-    /// `x-amz-request-id` rather than parsed XML.
+    /// headers into an ``ObjectMetadata`` value. On any non-2xx a
+    /// ``BucketServiceError`` is thrown — S3's HEAD responses have
+    /// an empty body even on errors, so the error falls into the
+    /// empty-body path of ``BucketServiceError/decode(httpStatus:body:)``
+    /// (sentinel ``code`` `"Unknown"`, ``httpStatus`` populated).
     ///
     /// - Parameters:
     ///   - bucket: Bucket name.
@@ -71,34 +76,40 @@ extension BucketClient {
         bucket: String,
         path: any BucketPath
     ) async throws -> ObjectMetadata {
-        try Task.checkCancellation()
+        do {
+            try Task.checkCancellation()
 
-        let key = path.resolve()
-        Self.removeLogger.debug("headObject start key=\(key, privacy: .public)")
+            let key = path.resolve()
+            Self.removeLogger.debug("headObject start key=\(key, privacy: .public)")
 
-        let request = try Self.buildSignedHeadRequest(
-            bucket: bucket,
-            key: key,
-            configuration: configuration
-        )
+            let request = try Self.buildSignedHeadRequest(
+                bucket: bucket,
+                key: key,
+                configuration: configuration
+            )
 
-        try Task.checkCancellation()
+            try Task.checkCancellation()
 
-        let (responseBody, response) = try await transport.send(request, body: nil)
+            let (responseBody, response) = try await transport.send(request, body: nil)
 
-        try Task.checkCancellation()
+            try Task.checkCancellation()
 
-        let status = response.statusCode
-        guard (200..<300).contains(status) else {
-            // TODO: replace with BucketServiceError after #0015. HEAD
-            // responses have no XML body so the typed mapping will
-            // rely on status + headers.
-            throw RemoveError.badStatus(status: status, body: responseBody)
+            let status = response.statusCode
+            guard (200..<300).contains(status) else {
+                // HEAD responses have no XML body, so `decode` will
+                // hit its empty-body fallback (sentinel code
+                // `"Unknown"`, `httpStatus` populated).
+                throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+            }
+
+            let metadata = Self.makeObjectMetadata(key: key, response: response)
+            Self.removeLogger.debug("headObject finish key=\(key, privacy: .public) status=\(status, privacy: .public)")
+            return metadata
+        } catch is CancellationError {
+            throw BucketClientError.cancelled
+        } catch let urlError as URLError {
+            throw BucketClientError.transport(urlError)
         }
-
-        let metadata = Self.makeObjectMetadata(key: key, response: response)
-        Self.removeLogger.debug("headObject finish key=\(key, privacy: .public) status=\(status, privacy: .public)")
-        return metadata
     }
 
     // MARK: - Internals
@@ -201,7 +212,9 @@ extension BucketClient {
     ) throws -> URL {
         let endpoint = configuration.endpoint
         guard let scheme = endpoint.scheme, let host = endpoint.host else {
-            throw RemoveError.invalidEndpoint(endpoint)
+            throw BucketClientError.invalidConfiguration(
+                "endpoint missing scheme or host: \(endpoint.absoluteString)"
+            )
         }
 
         // Encode the key as a sequence of `/`-separated segments so
@@ -238,7 +251,9 @@ extension BucketClient {
         }
 
         guard let url = components.url else {
-            throw RemoveError.invalidEndpoint(endpoint)
+            throw BucketClientError.invalidConfiguration(
+                "could not build object URL from endpoint: \(endpoint.absoluteString)"
+            )
         }
         return url
     }
@@ -327,16 +342,3 @@ extension BucketClient {
     }()
 }
 
-// TODO: replace with BucketServiceError after #0015.
-fileprivate struct RemoveError: Error {
-    let status: Int
-    let body: Data
-
-    static func badStatus(status: Int, body: Data) -> RemoveError {
-        RemoveError(status: status, body: body)
-    }
-
-    static func invalidEndpoint(_ url: URL) -> RemoveError {
-        RemoveError(status: -1, body: Data(url.absoluteString.utf8))
-    }
-}

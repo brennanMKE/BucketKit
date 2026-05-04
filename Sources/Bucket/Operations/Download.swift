@@ -73,6 +73,8 @@ extension BucketClient {
                 Self.downloadLogger.debug("downloadData finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
             } catch is CancellationError {
                 await state.cancel()
+            } catch let urlError as URLError {
+                await state.fail(with: BucketClientError.transport(urlError))
             } catch {
                 await state.fail(with: error)
             }
@@ -162,6 +164,8 @@ extension BucketClient {
                 Self.downloadLogger.debug("downloadFile finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
             } catch is CancellationError {
                 await state.cancel()
+            } catch let urlError as URLError {
+                await state.fail(with: BucketClientError.transport(urlError))
             } catch {
                 await state.fail(with: error)
             }
@@ -258,7 +262,9 @@ extension BucketClient {
     ) throws -> URL {
         let endpoint = configuration.endpoint
         guard let scheme = endpoint.scheme, let host = endpoint.host else {
-            throw DownloadError.invalidEndpoint(endpoint)
+            throw BucketClientError.invalidConfiguration(
+                "endpoint missing scheme or host: \(endpoint.absoluteString)"
+            )
         }
 
         // Encode the key as a sequence of `/`-separated segments so
@@ -287,7 +293,9 @@ extension BucketClient {
         }
 
         guard let url = components.url else {
-            throw DownloadError.invalidEndpoint(endpoint)
+            throw BucketClientError.invalidConfiguration(
+                "could not build object URL from endpoint: \(endpoint.absoluteString)"
+            )
         }
         return url
     }
@@ -295,28 +303,31 @@ extension BucketClient {
     /// Validates the response status for an in-memory download and
     /// returns the body on success. 200 (full body) and 206 (partial
     /// body for ranged requests) are both treated as success; any
-    /// other status surfaces as a placeholder error today and as a
-    /// `BucketServiceError` after #0015.
+    /// other status surfaces as a ``BucketServiceError`` decoded
+    /// from the response body.
     private static func makeDownloadData(
         response: HTTPURLResponse,
         body: Data
     ) throws -> Data {
-        try checkDownloadStatus(response: response)
-        return body
-    }
-
-    /// Shared status-code validation for both the in-memory and
-    /// file-streaming paths. `200` (full body) and `206` (ranged
-    /// partial body) are success; everything else throws.
-    private static func checkDownloadStatus(response: HTTPURLResponse) throws {
         let status = response.statusCode
         guard status == 200 || status == 206 else {
             // 304 Not Modified (If-None-Match) and 412 Precondition
-            // Failed (If-Match) intentionally fall into the same
-            // bucket here — callers can disambiguate after #0015 by
-            // inspecting `BucketServiceError.httpStatus`.
-            // TODO: replace with BucketServiceError after #0015.
-            throw DownloadError.badStatus(status: status, body: Data())
+            // Failed (If-Match) surface here as
+            // `BucketServiceError`s; callers disambiguate by
+            // inspecting `httpStatus`.
+            throw BucketServiceError.decode(httpStatus: status, body: body)
+        }
+        return body
+    }
+
+    /// Shared status-code validation for the file-streaming path,
+    /// where the body has already been written to disk and isn't
+    /// available for XML decoding. Falls back to the empty-body
+    /// path of ``BucketServiceError/decode(httpStatus:body:)``.
+    private static func checkDownloadStatus(response: HTTPURLResponse) throws {
+        let status = response.statusCode
+        guard status == 200 || status == 206 else {
+            throw BucketServiceError.decode(httpStatus: status, body: Data())
         }
     }
 
@@ -332,16 +343,3 @@ extension BucketClient {
     }
 }
 
-// TODO: replace with BucketServiceError after #0015.
-fileprivate struct DownloadError: Error {
-    let status: Int
-    let body: Data
-
-    static func badStatus(status: Int, body: Data) -> DownloadError {
-        DownloadError(status: status, body: body)
-    }
-
-    static func invalidEndpoint(_ url: URL) -> DownloadError {
-        DownloadError(status: -1, body: Data(url.absoluteString.utf8))
-    }
-}
