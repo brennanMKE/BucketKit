@@ -49,10 +49,17 @@ extension BucketClient {
             "getURL method=\(options.method.rawValue, privacy: .public) bucket=\(bucket, privacy: .public) keyLen=\(key.count, privacy: .public)"
         )
 
+        // Configuration-level extra headers participate in the
+        // signature exactly like ``GetURLOptions/headersToSign``.
+        // Operation headers win on key conflict — same merge order as
+        // every other operation in the package.
+        var headersToSign = options.headersToSign
+        configuration.mergeBaseHeaders(into: &headersToSign)
+
         return try PresignedURL.sign(
             method: options.method,
             url: baseURL,
-            additionalSignedHeaders: options.headersToSign,
+            additionalSignedHeaders: headersToSign,
             credentials: SigV4Signer.Credentials(
                 accessKeyID: configuration.accessKeyID,
                 secretAccessKey: configuration.secretAccessKey,

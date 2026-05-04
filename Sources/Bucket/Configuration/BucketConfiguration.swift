@@ -25,6 +25,20 @@ public struct BucketConfiguration: Sendable {
     /// (`https://endpoint/bucket/key`) instead of the default
     /// virtual-hosted style (`https://bucket.endpoint/key`).
     public var usePathStyle: Bool
+    /// Headers merged into every signed request the client emits.
+    ///
+    /// Operation-specific headers (Content-Type, x-amz-acl, the
+    /// x-amz-server-side-encryption family, etc.) are layered **on
+    /// top** of these — if a name appears in both, the operation's
+    /// value wins. The merge happens before SigV4 signing, so the
+    /// extra headers participate in the signature like any other
+    /// header.
+    ///
+    /// This is the escape hatch for headers BucketKit does not model
+    /// directly — e.g. `x-amz-bucket-key-enabled` to opt into S3
+    /// Bucket Keys for SSE-KMS, or vendor-specific `x-amz-` extensions
+    /// some S3-compatible services accept.
+    public var extraHeaders: [String: String]
 
     /// Memberwise initializer. Prefer the provider-specific factories.
     public init(
@@ -33,7 +47,8 @@ public struct BucketConfiguration: Sendable {
         accessKeyID: String,
         secretAccessKey: String,
         sessionToken: String? = nil,
-        usePathStyle: Bool
+        usePathStyle: Bool,
+        extraHeaders: [String: String] = [:]
     ) {
         self.endpoint = endpoint
         self.region = region
@@ -41,6 +56,7 @@ public struct BucketConfiguration: Sendable {
         self.secretAccessKey = secretAccessKey
         self.sessionToken = sessionToken
         self.usePathStyle = usePathStyle
+        self.extraHeaders = extraHeaders
     }
 
     // MARK: - Provider factories
@@ -53,7 +69,8 @@ public struct BucketConfiguration: Sendable {
         region: String,
         accessKeyID: String,
         secretAccessKey: String,
-        sessionToken: String? = nil
+        sessionToken: String? = nil,
+        extraHeaders: [String: String] = [:]
     ) -> Self {
         let endpoint = URL(string: "https://s3.\(region).amazonaws.com")!
         return Self(
@@ -62,7 +79,8 @@ public struct BucketConfiguration: Sendable {
             accessKeyID: accessKeyID,
             secretAccessKey: secretAccessKey,
             sessionToken: sessionToken,
-            usePathStyle: false
+            usePathStyle: false,
+            extraHeaders: extraHeaders
         )
     }
 
@@ -76,7 +94,8 @@ public struct BucketConfiguration: Sendable {
         accountID: String,
         accessKeyID: String,
         secretAccessKey: String,
-        jurisdiction: R2Jurisdiction = .default
+        jurisdiction: R2Jurisdiction = .default,
+        extraHeaders: [String: String] = [:]
     ) -> Self {
         let infix = jurisdiction.hostnameInfix
         let endpoint = URL(string: "https://\(accountID).\(infix)r2.cloudflarestorage.com")!
@@ -86,7 +105,8 @@ public struct BucketConfiguration: Sendable {
             accessKeyID: accessKeyID,
             secretAccessKey: secretAccessKey,
             sessionToken: nil,
-            usePathStyle: false
+            usePathStyle: false,
+            extraHeaders: extraHeaders
         )
     }
 
@@ -98,7 +118,8 @@ public struct BucketConfiguration: Sendable {
     public static func digitalOceanSpaces(
         region: String,
         accessKeyID: String,
-        secretAccessKey: String
+        secretAccessKey: String,
+        extraHeaders: [String: String] = [:]
     ) -> Self {
         let endpoint = URL(string: "https://\(region).digitaloceanspaces.com")!
         return Self(
@@ -107,7 +128,8 @@ public struct BucketConfiguration: Sendable {
             accessKeyID: accessKeyID,
             secretAccessKey: secretAccessKey,
             sessionToken: nil,
-            usePathStyle: false
+            usePathStyle: false,
+            extraHeaders: extraHeaders
         )
     }
 
@@ -121,7 +143,8 @@ public struct BucketConfiguration: Sendable {
         region: String,
         accessKeyID: String,
         secretAccessKey: String,
-        usePathStyle: Bool = true
+        usePathStyle: Bool = true,
+        extraHeaders: [String: String] = [:]
     ) -> Self {
         Self(
             endpoint: endpoint,
@@ -129,7 +152,8 @@ public struct BucketConfiguration: Sendable {
             accessKeyID: accessKeyID,
             secretAccessKey: secretAccessKey,
             sessionToken: nil,
-            usePathStyle: usePathStyle
+            usePathStyle: usePathStyle,
+            extraHeaders: extraHeaders
         )
     }
 }

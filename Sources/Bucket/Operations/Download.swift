@@ -224,6 +224,8 @@ extension BucketClient {
             headers["If-Match"] = ifMatch
         }
 
+        configuration.mergeBaseHeaders(into: &headers)
+
         let signer = SigV4Signer(configuration: configuration)
         let signed = signer.sign(
             SigV4Signer.Request(

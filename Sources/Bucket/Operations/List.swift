@@ -272,12 +272,15 @@ extension BucketClient {
             continuationToken: continuationToken
         )
 
+        var headers: [String: String] = [:]
+        configuration.mergeBaseHeaders(into: &headers)
+
         let signer = SigV4Signer(configuration: configuration)
         let signed = signer.sign(
             SigV4Signer.Request(
                 method: "GET",
                 url: url,
-                headers: [:],
+                headers: headers,
                 payloadHash: CanonicalRequest.emptyPayloadHash
             )
         )

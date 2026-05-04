@@ -485,11 +485,20 @@ extension BucketClient {
         if let ifNoneMatch {
             headers["If-None-Match"] = ifNoneMatch
         }
-        if serverSideEncryption != nil {
-            // TODO: translate ServerSideEncryption into
-            // x-amz-server-side-encryption* headers in #0020.
-            _ = serverSideEncryption
+        if let serverSideEncryption {
+            // Operation-driven SSE headers — translated centrally in
+            // ``ServerSideEncryption/headers``. They are merged into
+            // the request before signing so they participate in the
+            // SigV4 canonical headers block.
+            for (name, value) in serverSideEncryption.headers {
+                headers[name] = value
+            }
         }
+
+        // Configuration-level escape hatch (e.g.
+        // `x-amz-bucket-key-enabled`). Layered in last so the
+        // operation's own headers always win on conflict.
+        configuration.mergeBaseHeaders(into: &headers)
 
         let signer = SigV4Signer(configuration: configuration)
         let signed = signer.sign(

@@ -113,7 +113,8 @@ public actor MultipartUpload {
             partNumber: partNumber,
             payloadHash: payloadHash,
             contentLength: data.count,
-            configuration: configuration
+            configuration: configuration,
+            serverSideEncryption: initiateOptions.serverSideEncryption
         )
 
         let (responseBody, response) = try await transport.send(request, body: .data(data))
@@ -153,7 +154,8 @@ public actor MultipartUpload {
             partNumber: partNumber,
             payloadHash: CanonicalRequest.unsignedPayload,
             contentLength: contentLength,
-            configuration: configuration
+            configuration: configuration,
+            serverSideEncryption: initiateOptions.serverSideEncryption
         )
 
         let (responseBody, response) = try await transport.upload(request, fromFile: fileURL)
@@ -301,7 +303,8 @@ public actor MultipartUpload {
         partNumber: Int,
         payloadHash: String,
         contentLength: Int?,
-        configuration: BucketConfiguration
+        configuration: BucketConfiguration,
+        serverSideEncryption: ServerSideEncryption?
     ) throws -> URLRequest {
         let url = try MultipartURL.objectURL(
             bucket: bucket,
@@ -317,6 +320,17 @@ public actor MultipartUpload {
         if let contentLength {
             headers["Content-Length"] = String(contentLength)
         }
+        if let serverSideEncryption {
+            // SSE-C requires the customer-key headers to be re-sent on
+            // every UploadPart; KMS/AES256 inherit from the initiate
+            // call and need nothing here. ``uploadPartHeaders`` already
+            // makes that distinction.
+            for (name, value) in serverSideEncryption.uploadPartHeaders {
+                headers[name] = value
+            }
+        }
+
+        configuration.mergeBaseHeaders(into: &headers)
 
         let signer = SigV4Signer(configuration: configuration)
         let signed = signer.sign(
@@ -359,6 +373,8 @@ public actor MultipartUpload {
         headers["Content-Type"] = "application/xml"
         headers["Content-Length"] = String(body.count)
 
+        configuration.mergeBaseHeaders(into: &headers)
+
         let payloadHash = CanonicalRequest.sha256Hex(body)
         let signer = SigV4Signer(configuration: configuration)
         let signed = signer.sign(
@@ -392,12 +408,15 @@ public actor MultipartUpload {
             queryItems: [URLQueryItem(name: "uploadId", value: uploadID)]
         )
 
+        var headers: [String: String] = [:]
+        configuration.mergeBaseHeaders(into: &headers)
+
         let signer = SigV4Signer(configuration: configuration)
         let signed = signer.sign(
             SigV4Signer.Request(
                 method: "DELETE",
                 url: url,
-                headers: [:],
+                headers: headers,
                 payloadHash: CanonicalRequest.emptyPayloadHash
             )
         )
@@ -497,10 +516,17 @@ enum MultipartInitiator {
         if let ifNoneMatch = options.ifNoneMatch {
             headers["If-None-Match"] = ifNoneMatch
         }
-        // ServerSideEncryption header translation lands with #0020;
-        // initiate requests will pick it up automatically once the
-        // helper exists.
-        _ = options.serverSideEncryption
+        if let sse = options.serverSideEncryption {
+            // SSE headers are sent on `CreateMultipartUpload` and
+            // bind for the lifetime of the upload — KMS/AES256 inherit
+            // automatically on each part, while SSE-C must be re-sent
+            // on every UploadPart (handled inside ``MultipartUpload``).
+            for (name, value) in sse.headers {
+                headers[name] = value
+            }
+        }
+
+        configuration.mergeBaseHeaders(into: &headers)
 
         let signer = SigV4Signer(configuration: configuration)
         let signed = signer.sign(

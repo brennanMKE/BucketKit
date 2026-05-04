@@ -139,12 +139,15 @@ extension BucketClient {
             versionID: versionID
         )
 
+        var headers: [String: String] = [:]
+        configuration.mergeBaseHeaders(into: &headers)
+
         let signer = SigV4Signer(configuration: configuration)
         let signed = signer.sign(
             SigV4Signer.Request(
                 method: "DELETE",
                 url: url,
-                headers: [:],
+                headers: headers,
                 payloadHash: CanonicalRequest.emptyPayloadHash
             )
         )
@@ -176,12 +179,15 @@ extension BucketClient {
             versionID: nil
         )
 
+        var headers: [String: String] = [:]
+        configuration.mergeBaseHeaders(into: &headers)
+
         let signer = SigV4Signer(configuration: configuration)
         let signed = signer.sign(
             SigV4Signer.Request(
                 method: "HEAD",
                 url: url,
-                headers: [:],
+                headers: headers,
                 payloadHash: CanonicalRequest.emptyPayloadHash
             )
         )
