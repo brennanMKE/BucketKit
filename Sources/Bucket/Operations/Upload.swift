@@ -108,18 +108,27 @@ extension BucketClient {
     /// Uploads the contents of a local file to `bucket` at the key
     /// the supplied path resolves to.
     ///
-    /// Today this always uses a single-part PUT with
-    /// `x-amz-content-sha256: UNSIGNED-PAYLOAD` so the file does not
-    /// have to be read twice (once to hash, once to upload).
-    /// Automatic multipart switching for large files arrives in
-    /// #0019.
+    /// For files at or above the multipart threshold (default 100 MiB,
+    /// overridable via ``UploadFileOptions/partSize``), this
+    /// transparently switches to S3 multipart with parallel parts —
+    /// part size is computed to satisfy S3's 5 MiB-per-non-final-part
+    /// floor and 10,000-parts ceiling, and concurrency comes from
+    /// ``UploadFileOptions/concurrency`` (default 4). On any failure
+    /// — including structured task cancellation — the multipart path
+    /// issues a best-effort `AbortMultipartUpload`.
+    ///
+    /// For smaller files (or when the size cannot be determined), the
+    /// single-part PUT path uses `x-amz-content-sha256:
+    /// UNSIGNED-PAYLOAD` so the file is read once, streamed to the
+    /// transport.
     ///
     /// - Parameters:
     ///   - bucket: Bucket name.
     ///   - path: Object key, supplied as a ``BucketPath``.
     ///   - local: File on disk to upload. Must be readable by the
     ///     process. Streamed via `URLSession.upload(for:fromFile:)`.
-    ///   - options: Optional metadata, cache control, ACL, etc. See
+    ///   - options: Optional metadata, cache control, ACL, multipart
+    ///     part size and concurrency hints, etc. See
     ///     ``UploadFileOptions``.
     public func uploadFile(
         bucket: String,
@@ -127,7 +136,6 @@ extension BucketClient {
         local: URL,
         options: UploadFileOptions = .init()
     ) -> BucketUploadFileTask {
-        // TODO: switch to multipart above options.partSize / 100 MiB threshold (#0019)
         let (task, state) = BucketUploadFileTask.make()
 
         let configuration = self.configuration
@@ -139,48 +147,31 @@ extension BucketClient {
                 try Task.checkCancellation()
 
                 let totalBytes = Self.fileSize(at: local)
+                let threshold = Int64(options.partSize ?? Self.defaultMultipartThreshold)
 
-                Self.logger.debug("uploadFile start key=\(key, privacy: .public) bytes=\(totalBytes ?? -1, privacy: .public)")
-                await state.yieldProgress(
-                    TransferProgress(totalBytes: totalBytes, bytesTransferred: 0)
-                )
-
-                let request = try Self.buildSignedPutRequest(
-                    bucket: bucket,
-                    key: key,
-                    configuration: configuration,
-                    payloadHash: CanonicalRequest.unsignedPayload,
-                    contentLength: totalBytes.map(Int.init),
-                    contentType: options.contentType,
-                    cacheControl: options.cacheControl,
-                    metadata: options.metadata,
-                    acl: options.acl,
-                    storageClass: options.storageClass,
-                    serverSideEncryption: options.serverSideEncryption,
-                    ifNoneMatch: options.ifNoneMatch
-                )
-
-                try Task.checkCancellation()
-
-                // TODO: byte-level progress via URLSessionTaskDelegate.
-                let (responseBody, response) = try await transport.upload(request, fromFile: local)
-
-                try Task.checkCancellation()
-
-                let result = try Self.makeUploadResult(
-                    key: key,
-                    response: response,
-                    body: responseBody
-                )
-
-                await state.yieldProgress(
-                    TransferProgress(
-                        totalBytes: totalBytes,
-                        bytesTransferred: totalBytes ?? 0
+                if let total = totalBytes, total >= threshold {
+                    try await Self.runMultipartFileUpload(
+                        bucket: bucket,
+                        key: key,
+                        local: local,
+                        fileSize: total,
+                        options: options,
+                        configuration: configuration,
+                        transport: transport,
+                        state: state
                     )
-                )
-                await state.finish(with: result)
-                Self.logger.debug("uploadFile finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
+                } else {
+                    try await Self.runSinglePartFileUpload(
+                        bucket: bucket,
+                        key: key,
+                        local: local,
+                        totalBytes: totalBytes,
+                        options: options,
+                        configuration: configuration,
+                        transport: transport,
+                        state: state
+                    )
+                }
             } catch is CancellationError {
                 await state.cancel()
             } catch let urlError as URLError {
@@ -201,11 +192,246 @@ extension BucketClient {
         return task
     }
 
+    // MARK: - uploadFile dispatch helpers
+
+    /// Single-part PUT path used for files below the multipart
+    /// threshold (or for files whose size could not be read).
+    private static func runSinglePartFileUpload(
+        bucket: String,
+        key: String,
+        local: URL,
+        totalBytes: Int64?,
+        options: UploadFileOptions,
+        configuration: BucketConfiguration,
+        transport: any HTTPTransport,
+        state: TransferTaskState<UploadResult>
+    ) async throws {
+        try Task.checkCancellation()
+
+        Self.logger.debug("uploadFile start key=\(key, privacy: .public) bytes=\(totalBytes ?? -1, privacy: .public)")
+        await state.yieldProgress(
+            TransferProgress(totalBytes: totalBytes, bytesTransferred: 0)
+        )
+
+        let request = try Self.buildSignedPutRequest(
+            bucket: bucket,
+            key: key,
+            configuration: configuration,
+            payloadHash: CanonicalRequest.unsignedPayload,
+            contentLength: totalBytes.map(Int.init),
+            contentType: options.contentType,
+            cacheControl: options.cacheControl,
+            metadata: options.metadata,
+            acl: options.acl,
+            storageClass: options.storageClass,
+            serverSideEncryption: options.serverSideEncryption,
+            ifNoneMatch: options.ifNoneMatch
+        )
+
+        try Task.checkCancellation()
+
+        // TODO: byte-level progress via URLSessionTaskDelegate.
+        let (responseBody, response) = try await transport.upload(request, fromFile: local)
+
+        try Task.checkCancellation()
+
+        let result = try Self.makeUploadResult(
+            key: key,
+            response: response,
+            body: responseBody
+        )
+
+        await state.yieldProgress(
+            TransferProgress(
+                totalBytes: totalBytes,
+                bytesTransferred: totalBytes ?? 0
+            )
+        )
+        await state.finish(with: result)
+        Self.logger.debug("uploadFile finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
+    }
+
+    /// Multipart auto-switching path. Initiates the upload, slices
+    /// the file into parts that satisfy S3's 5 MiB floor / 10,000
+    /// part ceiling, dispatches them in parallel through a
+    /// `TaskGroup` capped by `options.concurrency ?? 4`, and on
+    /// success completes the upload. On any error — including
+    /// structured cancellation — issues a best-effort
+    /// `AbortMultipartUpload` and rethrows (or converts to
+    /// `BucketClientError.cancelled`).
+    private static func runMultipartFileUpload(
+        bucket: String,
+        key: String,
+        local: URL,
+        fileSize: Int64,
+        options: UploadFileOptions,
+        configuration: BucketConfiguration,
+        transport: any HTTPTransport,
+        state: TransferTaskState<UploadResult>
+    ) async throws {
+        try Task.checkCancellation()
+
+        let partSize = computeMultipartPartSize(fileSize: fileSize)
+        let totalParts = Int((fileSize + Int64(partSize) - 1) / Int64(partSize))
+        let concurrency = max(1, options.concurrency ?? defaultMultipartConcurrency)
+
+        Self.multipartLogger.debug(
+            "uploadFile-multipart start key=\(key, privacy: .public) bytes=\(fileSize, privacy: .public) parts=\(totalParts, privacy: .public) partSize=\(partSize, privacy: .public) concurrency=\(concurrency, privacy: .public)"
+        )
+
+        await state.yieldProgress(
+            TransferProgress(totalBytes: fileSize, bytesTransferred: 0)
+        )
+
+        let initiateOptions = makeUploadDataOptions(from: options)
+        let uploadID = try await MultipartInitiator.initiate(
+            bucket: bucket,
+            key: key,
+            configuration: configuration,
+            transport: transport,
+            options: initiateOptions
+        )
+
+        let upload = MultipartUpload(
+            configuration: configuration,
+            transport: transport,
+            bucket: bucket,
+            key: key,
+            uploadID: uploadID,
+            options: initiateOptions
+        )
+
+        do {
+            // Read parts from disk on this task and farm them out to
+            // a TaskGroup capped at `concurrency`. The reader is
+            // sequential (one FileHandle, one read at a time) so we
+            // do not need extra serialization beyond the actor that
+            // owns the handle.
+            let reader = try MultipartFileReader(fileURL: local, partSize: partSize)
+            defer { reader.close() }
+
+            try await withThrowingTaskGroup(
+                of: (UploadedPart, Int).self
+            ) { group in
+                var nextPartNumber = 1
+                var inFlight = 0
+                var bytesTransferred: Int64 = 0
+
+                while nextPartNumber <= totalParts {
+                    if inFlight >= concurrency {
+                        let (_, partBytes) = try await group.next()!
+                        inFlight -= 1
+                        bytesTransferred += Int64(partBytes)
+                        await state.yieldProgress(
+                            TransferProgress(
+                                totalBytes: fileSize,
+                                bytesTransferred: bytesTransferred
+                            )
+                        )
+                    }
+
+                    try Task.checkCancellation()
+
+                    let partNumber = nextPartNumber
+                    nextPartNumber += 1
+                    let chunk = try reader.readNext()
+                    let partBytes = chunk.count
+
+                    group.addTask {
+                        let part = try await upload.uploadPart(chunk, partNumber: partNumber)
+                        return (part, partBytes)
+                    }
+                    inFlight += 1
+                }
+
+                // Drain remaining results.
+                while inFlight > 0 {
+                    let (_, partBytes) = try await group.next()!
+                    inFlight -= 1
+                    bytesTransferred += Int64(partBytes)
+                    await state.yieldProgress(
+                        TransferProgress(
+                            totalBytes: fileSize,
+                            bytesTransferred: bytesTransferred
+                        )
+                    )
+                }
+            }
+
+            try Task.checkCancellation()
+
+            let result = try await upload.complete()
+            await state.yieldProgress(
+                TransferProgress(totalBytes: fileSize, bytesTransferred: fileSize)
+            )
+            await state.finish(with: result)
+            Self.multipartLogger.debug(
+                "uploadFile-multipart finish key=\(key, privacy: .public) parts=\(totalParts, privacy: .public)"
+            )
+        } catch is CancellationError {
+            try? await upload.abort()
+            throw BucketClientError.cancelled
+        } catch {
+            try? await upload.abort()
+            throw error
+        }
+    }
+
+    /// Computes the per-part size for the auto-switching path.
+    ///
+    /// Default is 8 MiB, but when the file is larger than `8 MiB *
+    /// 10,000` we scale the part size up so we stay under S3's
+    /// 10,000-part ceiling. The result is clamped to
+    /// `[5 MiB, 5 GiB]`.
+    fileprivate static func computeMultipartPartSize(fileSize: Int64) -> Int {
+        let fiveMiB = 5 * 1024 * 1024
+        let eightMiB = 8 * 1024 * 1024
+        let fiveGiB: Int64 = 5 * 1024 * 1024 * 1024
+        let maxParts: Int64 = 10_000
+
+        let minimumForCount = (fileSize + maxParts - 1) / maxParts
+        var partSize: Int64 = max(Int64(eightMiB), minimumForCount)
+        partSize = max(Int64(fiveMiB), partSize)
+        partSize = min(fiveGiB, partSize)
+        return Int(partSize)
+    }
+
+    /// Default multipart trigger threshold (100 MiB).
+    fileprivate static let defaultMultipartThreshold: Int = 100 * 1024 * 1024
+
+    /// Default multipart parallelism.
+    fileprivate static let defaultMultipartConcurrency: Int = 4
+
+    /// Adapts an ``UploadFileOptions`` into the
+    /// ``UploadDataOptions`` shape the multipart helpers consume.
+    /// The two structs are intentionally field-identical (see
+    /// ``UploadFileOptions``); this is just a copy.
+    fileprivate static func makeUploadDataOptions(
+        from options: UploadFileOptions
+    ) -> UploadDataOptions {
+        UploadDataOptions(
+            contentType: options.contentType,
+            cacheControl: options.cacheControl,
+            metadata: options.metadata,
+            acl: options.acl,
+            storageClass: options.storageClass,
+            serverSideEncryption: options.serverSideEncryption,
+            ifNoneMatch: options.ifNoneMatch,
+            partSize: options.partSize,
+            concurrency: options.concurrency
+        )
+    }
+
     // MARK: - Internals
 
     private static let logger = Logger(
         subsystem: "dev.brennanmke.bucket",
         category: "client"
+    )
+
+    private static let multipartLogger = Logger(
+        subsystem: "dev.brennanmke.bucket",
+        category: "multipart"
     )
 
     /// Builds the signed `URLRequest` for a `PUT` against `bucket`/`key`.
@@ -360,13 +586,69 @@ extension BucketClient {
         return UploadResult(key: key, eTag: trimmed, versionID: versionID)
     }
 
-    /// Best-effort byte size lookup for a local file, used purely for
-    /// progress reporting. Returns `nil` if the size can't be read,
-    /// which surfaces as `totalBytes == nil` on the progress event.
-    private static func fileSize(at url: URL) -> Int64? {
-        guard let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
-              let size = values.fileSize else { return nil }
-        return Int64(size)
+    /// Best-effort byte size lookup for a local file, used both for
+    /// progress reporting and for the multipart auto-switching
+    /// threshold. Returns `nil` if the size can't be read, which
+    /// surfaces as `totalBytes == nil` on the progress event and
+    /// keeps `uploadFile` on the single-part path.
+    static func fileSize(at url: URL) -> Int64? {
+        // Prefer `FileManager.attributesOfItem(atPath:)` because it
+        // returns a 64-bit `NSNumber` directly; `URLResourceValues`
+        // falls back to `Int` (32-bit on some target architectures
+        // historically) which would silently truncate large files.
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: url.path),
+           let size = attrs[.size] as? NSNumber {
+            return size.int64Value
+        }
+        if let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+           let size = values.fileSize {
+            return Int64(size)
+        }
+        return nil
+    }
+}
+
+// MARK: - MultipartFileReader
+
+/// Sequential file reader used by the multipart auto-switching path.
+///
+/// Reads `partSize` bytes per call, returning a `Data` whose count is
+/// `partSize` for every part except the last (which may be shorter).
+/// Errors from `FileHandle` propagate as `BucketClientError` so the
+/// surrounding `do/catch` can convert them uniformly.
+final class MultipartFileReader: @unchecked Sendable {
+    private let handle: FileHandle
+    private let partSize: Int
+
+    init(fileURL: URL, partSize: Int) throws {
+        do {
+            self.handle = try FileHandle(forReadingFrom: fileURL)
+        } catch {
+            throw BucketClientError.invalidConfiguration(
+                "could not open file for multipart upload: \(error.localizedDescription)"
+            )
+        }
+        self.partSize = partSize
+    }
+
+    /// Reads up to `partSize` bytes from the current offset.
+    /// Returns `Data()` (empty) when the file is exhausted.
+    func readNext() throws -> Data {
+        do {
+            // `read(upToCount:)` is the modern non-throwing-on-EOF
+            // variant. On Apple platforms it is available since 13.4
+            // / 16.4, which is below our minimum deployment target.
+            let chunk = try handle.read(upToCount: partSize) ?? Data()
+            return chunk
+        } catch {
+            throw BucketClientError.invalidConfiguration(
+                "failed to read part from file: \(error.localizedDescription)"
+            )
+        }
+    }
+
+    func close() {
+        try? handle.close()
     }
 }
 
