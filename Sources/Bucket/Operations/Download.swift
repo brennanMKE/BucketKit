@@ -27,7 +27,11 @@ extension BucketClient {
 
         let configuration = self.configuration
         let transport = self.transport
+        let retryPolicy = self.retryPolicy
         let key = path.resolve()
+        let range = options.range
+        let ifNoneMatch = options.ifNoneMatch
+        let ifMatch = options.ifMatch
 
         // Run the download on a child Task so the public API stays
         // synchronous (returns the task value immediately) while the
@@ -41,26 +45,37 @@ extension BucketClient {
                     TransferProgress(totalBytes: nil, bytesTransferred: 0)
                 )
 
-                let request = try Self.buildSignedGetRequest(
-                    bucket: bucket,
-                    key: key,
-                    configuration: configuration,
-                    range: options.range,
-                    ifNoneMatch: options.ifNoneMatch,
-                    ifMatch: options.ifMatch
-                )
+                let (data, response) = try await RetryRunner.run(
+                    policy: retryPolicy,
+                    logger: Self.downloadLogger
+                ) { _ -> (Data, HTTPURLResponse) in
+                    try Task.checkCancellation()
 
-                try Task.checkCancellation()
+                    // Re-sign on every attempt: `X-Amz-Date` differs
+                    // per signature, so the closure must include the
+                    // signing step.
+                    let request = try Self.buildSignedGetRequest(
+                        bucket: bucket,
+                        key: key,
+                        configuration: configuration,
+                        range: range,
+                        ifNoneMatch: ifNoneMatch,
+                        ifMatch: ifMatch
+                    )
 
-                // TODO: byte-level progress via URLSessionTaskDelegate.
-                let (responseBody, response) = try await transport.send(request, body: nil)
+                    try Task.checkCancellation()
 
-                try Task.checkCancellation()
+                    // TODO: byte-level progress via URLSessionTaskDelegate.
+                    let (responseBody, response) = try await transport.send(request, body: nil)
 
-                let data = try Self.makeDownloadData(
-                    response: response,
-                    body: responseBody
-                )
+                    try Task.checkCancellation()
+
+                    let data = try Self.makeDownloadData(
+                        response: response,
+                        body: responseBody
+                    )
+                    return (data, response)
+                }
 
                 let totalBytes = Self.contentLength(from: response)
                 await state.yieldProgress(
@@ -124,7 +139,11 @@ extension BucketClient {
 
         let configuration = self.configuration
         let transport = self.transport
+        let retryPolicy = self.retryPolicy
         let key = path.resolve()
+        let range = options.range
+        let ifNoneMatch = options.ifNoneMatch
+        let ifMatch = options.ifMatch
 
         let work = Task {
             do {
@@ -135,23 +154,31 @@ extension BucketClient {
                     TransferProgress(totalBytes: nil, bytesTransferred: 0)
                 )
 
-                let request = try Self.buildSignedGetRequest(
-                    bucket: bucket,
-                    key: key,
-                    configuration: configuration,
-                    range: options.range,
-                    ifNoneMatch: options.ifNoneMatch,
-                    ifMatch: options.ifMatch
-                )
+                let response = try await RetryRunner.run(
+                    policy: retryPolicy,
+                    logger: Self.downloadLogger
+                ) { _ -> HTTPURLResponse in
+                    try Task.checkCancellation()
 
-                try Task.checkCancellation()
+                    let request = try Self.buildSignedGetRequest(
+                        bucket: bucket,
+                        key: key,
+                        configuration: configuration,
+                        range: range,
+                        ifNoneMatch: ifNoneMatch,
+                        ifMatch: ifMatch
+                    )
 
-                // TODO: byte-level progress via URLSessionTaskDelegate.
-                let response = try await transport.download(request, to: local)
+                    try Task.checkCancellation()
 
-                try Task.checkCancellation()
+                    // TODO: byte-level progress via URLSessionTaskDelegate.
+                    let response = try await transport.download(request, to: local)
 
-                try Self.checkDownloadStatus(response: response)
+                    try Task.checkCancellation()
+
+                    try Self.checkDownloadStatus(response: response)
+                    return response
+                }
 
                 let totalBytes = Self.contentLength(from: response)
                 await state.yieldProgress(

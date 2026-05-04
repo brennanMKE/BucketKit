@@ -21,39 +21,44 @@ extension BucketClient {
     ///
     /// - Returns: Every bucket the caller owns.
     public func listBuckets() async throws -> [BucketInfo] {
+        let configuration = self.configuration
+        let transport = self.transport
+
+        Self.bucketsLogger.debug("listBuckets start")
+
         do {
-            try Task.checkCancellation()
+            return try await RetryRunner.run(policy: retryPolicy, logger: Self.bucketsLogger) { _ in
+                try Task.checkCancellation()
 
-            Self.bucketsLogger.debug("listBuckets start")
+                let request = try Self.buildSignedListBucketsRequest(
+                    configuration: configuration
+                )
 
-            let request = try Self.buildSignedListBucketsRequest(
-                configuration: configuration
-            )
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let (responseBody, response) = try await transport.send(request, body: nil)
 
-            let (responseBody, response) = try await transport.send(request, body: nil)
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let status = response.statusCode
+                guard (200..<300).contains(status) else {
+                    throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+                }
 
-            let status = response.statusCode
-            guard (200..<300).contains(status) else {
-                throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+                let decoded: ListAllMyBucketsResult
+                do {
+                    decoded = try XMLDecoder.decode(ListAllMyBucketsResult.self, from: responseBody)
+                } catch {
+                    throw BucketClientError.decodingFailed(String(describing: error))
+                }
+
+                let buckets = decoded.buckets.map { entry in
+                    BucketInfo(name: entry.name, creationDate: entry.creationDate)
+                }
+
+                Self.bucketsLogger.debug("listBuckets finish status=\(status, privacy: .public) count=\(buckets.count, privacy: .public)")
+                return buckets
             }
-
-            let decoded: ListAllMyBucketsResult
-            do {
-                decoded = try XMLDecoder.decode(ListAllMyBucketsResult.self, from: responseBody)
-            } catch {
-                throw BucketClientError.decodingFailed(String(describing: error))
-            }
-
-            let buckets = decoded.buckets.map { entry in
-                BucketInfo(name: entry.name, creationDate: entry.creationDate)
-            }
-
-            Self.bucketsLogger.debug("listBuckets finish status=\(status, privacy: .public) count=\(buckets.count, privacy: .public)")
-            return buckets
         } catch is CancellationError {
             throw BucketClientError.cancelled
         } catch let urlError as URLError {
@@ -98,49 +103,54 @@ extension BucketClient {
         _ name: String,
         locationConstraint: String? = nil
     ) async throws {
-        do {
-            try Task.checkCancellation()
+        let configuration = self.configuration
+        let transport = self.transport
 
-            Self.bucketsLogger.debug(
-                "createBucket start bucket=\(name, privacy: .public) locationConstraint=\(locationConstraint ?? "-", privacy: .public)"
-            )
+        Self.bucketsLogger.debug(
+            "createBucket start bucket=\(name, privacy: .public) locationConstraint=\(locationConstraint ?? "-", privacy: .public)"
+        )
 
-            // AWS rejects a CreateBucketConfiguration body for
-            // us-east-1. We treat that as "no body" so the call
-            // shapes the same request the AWS console would.
-            let body: Data? = {
-                guard let region = locationConstraint, region != "us-east-1" else {
-                    return nil
-                }
-                let xml =
-                    "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" +
-                    "<LocationConstraint>\(region)</LocationConstraint>" +
-                    "</CreateBucketConfiguration>"
-                return Data(xml.utf8)
-            }()
-
-            let request = try Self.buildSignedBucketRequest(
-                method: "PUT",
-                bucket: name,
-                configuration: configuration,
-                body: body
-            )
-
-            try Task.checkCancellation()
-
-            let transportBody: TransportBody? = body.map { .data($0) }
-            let (responseBody, response) = try await transport.send(request, body: transportBody)
-
-            try Task.checkCancellation()
-
-            let status = response.statusCode
-            guard (200..<300).contains(status) else {
-                throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+        // AWS rejects a CreateBucketConfiguration body for
+        // us-east-1. We treat that as "no body" so the call
+        // shapes the same request the AWS console would.
+        let body: Data? = {
+            guard let region = locationConstraint, region != "us-east-1" else {
+                return nil
             }
+            let xml =
+                "<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">" +
+                "<LocationConstraint>\(region)</LocationConstraint>" +
+                "</CreateBucketConfiguration>"
+            return Data(xml.utf8)
+        }()
 
-            Self.bucketsLogger.debug(
-                "createBucket finish bucket=\(name, privacy: .public) status=\(status, privacy: .public)"
-            )
+        do {
+            try await RetryRunner.run(policy: retryPolicy, logger: Self.bucketsLogger) { _ in
+                try Task.checkCancellation()
+
+                let request = try Self.buildSignedBucketRequest(
+                    method: "PUT",
+                    bucket: name,
+                    configuration: configuration,
+                    body: body
+                )
+
+                try Task.checkCancellation()
+
+                let transportBody: TransportBody? = body.map { .data($0) }
+                let (responseBody, response) = try await transport.send(request, body: transportBody)
+
+                try Task.checkCancellation()
+
+                let status = response.statusCode
+                guard (200..<300).contains(status) else {
+                    throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+                }
+
+                Self.bucketsLogger.debug(
+                    "createBucket finish bucket=\(name, privacy: .public) status=\(status, privacy: .public)"
+                )
+            }
         } catch is CancellationError {
             throw BucketClientError.cancelled
         } catch let urlError as URLError {
@@ -159,32 +169,37 @@ extension BucketClient {
     ///
     /// - Parameter name: Bucket name to delete.
     public func deleteBucket(_ name: String) async throws {
+        let configuration = self.configuration
+        let transport = self.transport
+
+        Self.bucketsLogger.debug("deleteBucket start bucket=\(name, privacy: .public)")
+
         do {
-            try Task.checkCancellation()
+            try await RetryRunner.run(policy: retryPolicy, logger: Self.bucketsLogger) { _ in
+                try Task.checkCancellation()
 
-            Self.bucketsLogger.debug("deleteBucket start bucket=\(name, privacy: .public)")
+                let request = try Self.buildSignedBucketRequest(
+                    method: "DELETE",
+                    bucket: name,
+                    configuration: configuration,
+                    body: nil
+                )
 
-            let request = try Self.buildSignedBucketRequest(
-                method: "DELETE",
-                bucket: name,
-                configuration: configuration,
-                body: nil
-            )
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let (responseBody, response) = try await transport.send(request, body: nil)
 
-            let (responseBody, response) = try await transport.send(request, body: nil)
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let status = response.statusCode
+                guard (200..<300).contains(status) else {
+                    throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+                }
 
-            let status = response.statusCode
-            guard (200..<300).contains(status) else {
-                throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+                Self.bucketsLogger.debug(
+                    "deleteBucket finish bucket=\(name, privacy: .public) status=\(status, privacy: .public)"
+                )
             }
-
-            Self.bucketsLogger.debug(
-                "deleteBucket finish bucket=\(name, privacy: .public) status=\(status, privacy: .public)"
-            )
         } catch is CancellationError {
             throw BucketClientError.cancelled
         } catch let urlError as URLError {
@@ -207,41 +222,46 @@ extension BucketClient {
     /// - Parameter name: Bucket name.
     /// - Returns: Region (and any future bucket-level metadata).
     public func headBucket(_ name: String) async throws -> BucketMetadata {
+        let configuration = self.configuration
+        let transport = self.transport
+
+        Self.bucketsLogger.debug("headBucket start bucket=\(name, privacy: .public)")
+
         do {
-            try Task.checkCancellation()
+            return try await RetryRunner.run(policy: retryPolicy, logger: Self.bucketsLogger) { _ in
+                try Task.checkCancellation()
 
-            Self.bucketsLogger.debug("headBucket start bucket=\(name, privacy: .public)")
+                let request = try Self.buildSignedBucketRequest(
+                    method: "HEAD",
+                    bucket: name,
+                    configuration: configuration,
+                    body: nil
+                )
 
-            let request = try Self.buildSignedBucketRequest(
-                method: "HEAD",
-                bucket: name,
-                configuration: configuration,
-                body: nil
-            )
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let (responseBody, response) = try await transport.send(request, body: nil)
 
-            let (responseBody, response) = try await transport.send(request, body: nil)
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let status = response.statusCode
+                if status == 404 {
+                    // Synthesize the typed error explicitly so the body
+                    // (which is empty on a HEAD) does not matter — callers
+                    // get a populated `httpStatus = 404` error to match on.
+                    throw BucketServiceError.decode(httpStatus: 404, body: Data())
+                }
+                guard (200..<300).contains(status) else {
+                    throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+                }
 
-            let status = response.statusCode
-            if status == 404 {
-                // Synthesize the typed error explicitly so the body
-                // (which is empty on a HEAD) does not matter — callers
-                // get a populated `httpStatus = 404` error to match on.
-                throw BucketServiceError.decode(httpStatus: 404, body: Data())
+                let region = Self.firstHeader(named: "x-amz-bucket-region", in: response)
+
+                Self.bucketsLogger.debug(
+                    "headBucket finish bucket=\(name, privacy: .public) status=\(status, privacy: .public) region=\(region ?? "-", privacy: .public)"
+                )
+                return BucketMetadata(region: region)
             }
-            guard (200..<300).contains(status) else {
-                throw BucketServiceError.decode(httpStatus: status, body: responseBody)
-            }
-
-            let region = Self.firstHeader(named: "x-amz-bucket-region", in: response)
-
-            Self.bucketsLogger.debug(
-                "headBucket finish bucket=\(name, privacy: .public) status=\(status, privacy: .public) region=\(region ?? "-", privacy: .public)"
-            )
-            return BucketMetadata(region: region)
         } catch is CancellationError {
             throw BucketClientError.cancelled
         } catch let urlError as URLError {

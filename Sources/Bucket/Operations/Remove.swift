@@ -26,32 +26,41 @@ extension BucketClient {
         path: any BucketPath,
         options: RemoveOptions = .init()
     ) async throws -> String {
+        let key = path.resolve()
+        let configuration = self.configuration
+        let transport = self.transport
+        let versionID = options.versionID
+
+        Self.removeLogger.debug("remove start key=\(key, privacy: .public) versionID=\(versionID ?? "-", privacy: .public)")
+
         do {
-            try Task.checkCancellation()
+            return try await RetryRunner.run(policy: retryPolicy, logger: Self.removeLogger) { _ in
+                try Task.checkCancellation()
 
-            let key = path.resolve()
-            Self.removeLogger.debug("remove start key=\(key, privacy: .public) versionID=\(options.versionID ?? "-", privacy: .public)")
+                // Re-sign on every attempt: `X-Amz-Date` differs per
+                // signature, so the closure must include the signing
+                // step.
+                let request = try Self.buildSignedDeleteRequest(
+                    bucket: bucket,
+                    key: key,
+                    configuration: configuration,
+                    versionID: versionID
+                )
 
-            let request = try Self.buildSignedDeleteRequest(
-                bucket: bucket,
-                key: key,
-                configuration: configuration,
-                versionID: options.versionID
-            )
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let (responseBody, response) = try await transport.send(request, body: nil)
 
-            let (responseBody, response) = try await transport.send(request, body: nil)
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let status = response.statusCode
+                guard status == 204 || status == 200 else {
+                    throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+                }
 
-            let status = response.statusCode
-            guard status == 204 || status == 200 else {
-                throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+                Self.removeLogger.debug("remove finish key=\(key, privacy: .public) status=\(status, privacy: .public)")
+                return key
             }
-
-            Self.removeLogger.debug("remove finish key=\(key, privacy: .public) status=\(status, privacy: .public)")
-            return key
         } catch is CancellationError {
             throw BucketClientError.cancelled
         } catch let urlError as URLError {
@@ -76,35 +85,40 @@ extension BucketClient {
         bucket: String,
         path: any BucketPath
     ) async throws -> ObjectMetadata {
+        let key = path.resolve()
+        let configuration = self.configuration
+        let transport = self.transport
+
+        Self.removeLogger.debug("headObject start key=\(key, privacy: .public)")
+
         do {
-            try Task.checkCancellation()
+            return try await RetryRunner.run(policy: retryPolicy, logger: Self.removeLogger) { _ in
+                try Task.checkCancellation()
 
-            let key = path.resolve()
-            Self.removeLogger.debug("headObject start key=\(key, privacy: .public)")
+                let request = try Self.buildSignedHeadRequest(
+                    bucket: bucket,
+                    key: key,
+                    configuration: configuration
+                )
 
-            let request = try Self.buildSignedHeadRequest(
-                bucket: bucket,
-                key: key,
-                configuration: configuration
-            )
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let (responseBody, response) = try await transport.send(request, body: nil)
 
-            let (responseBody, response) = try await transport.send(request, body: nil)
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let status = response.statusCode
+                guard (200..<300).contains(status) else {
+                    // HEAD responses have no XML body, so `decode` will
+                    // hit its empty-body fallback (sentinel code
+                    // `"Unknown"`, `httpStatus` populated).
+                    throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+                }
 
-            let status = response.statusCode
-            guard (200..<300).contains(status) else {
-                // HEAD responses have no XML body, so `decode` will
-                // hit its empty-body fallback (sentinel code
-                // `"Unknown"`, `httpStatus` populated).
-                throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+                let metadata = Self.makeObjectMetadata(key: key, response: response)
+                Self.removeLogger.debug("headObject finish key=\(key, privacy: .public) status=\(status, privacy: .public)")
+                return metadata
             }
-
-            let metadata = Self.makeObjectMetadata(key: key, response: response)
-            Self.removeLogger.debug("headObject finish key=\(key, privacy: .public) status=\(status, privacy: .public)")
-            return metadata
         } catch is CancellationError {
             throw BucketClientError.cancelled
         } catch let urlError as URLError {

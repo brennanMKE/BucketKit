@@ -28,6 +28,13 @@ public actor BucketClient {
     /// for callers that need a custom `URLSession` configuration.
     public nonisolated let transport: any HTTPTransport
 
+    /// Retry policy applied uniformly to every HTTP dispatch this
+    /// client performs. Defaults to ``RetryPolicy/default`` (5
+    /// attempts, 100 ms base, 20 s cap, retry on 5xx and the AWS SDK
+    /// transient-error set). Pass ``RetryPolicy/none`` to disable
+    /// retries for tests or specialised callers.
+    public nonisolated let retryPolicy: RetryPolicy
+
     /// Creates a client bound to the supplied configuration and
     /// transport.
     ///
@@ -38,11 +45,15 @@ public actor BucketClient {
     ///   - transport: Networking seam. Defaults to
     ///     ``URLSessionTransport/shared``; tests typically inject a
     ///     fake conforming to ``HTTPTransport``.
+    ///   - retryPolicy: Retry policy applied to every HTTP dispatch.
+    ///     Defaults to ``RetryPolicy/default``.
     public init(
         configuration: BucketConfiguration,
-        transport: any HTTPTransport = URLSessionTransport.shared
+        transport: any HTTPTransport = URLSessionTransport.shared,
+        retryPolicy: RetryPolicy = .default
     ) {
         self.configuration = configuration
         self.transport = transport
+        self.retryPolicy = retryPolicy
     }
 }

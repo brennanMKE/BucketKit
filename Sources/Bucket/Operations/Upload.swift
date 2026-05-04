@@ -32,8 +32,10 @@ extension BucketClient {
 
         let configuration = self.configuration
         let transport = self.transport
+        let retryPolicy = self.retryPolicy
         let key = path.resolve()
         let totalBytes = Int64(data.count)
+        let capturedOptions = options
 
         // Run the upload on a child Task so the public API stays
         // synchronous (returns the task value immediately) while the
@@ -48,39 +50,52 @@ extension BucketClient {
                 )
 
                 let payloadHash = CanonicalRequest.sha256Hex(data)
-                let request = try Self.buildSignedPutRequest(
-                    bucket: bucket,
-                    key: key,
-                    configuration: configuration,
-                    payloadHash: payloadHash,
-                    contentLength: data.count,
-                    contentType: options.contentType,
-                    cacheControl: options.cacheControl,
-                    metadata: options.metadata,
-                    acl: options.acl,
-                    storageClass: options.storageClass,
-                    serverSideEncryption: options.serverSideEncryption,
-                    ifNoneMatch: options.ifNoneMatch
-                )
 
-                try Task.checkCancellation()
+                // S3 PUT is idempotent at the bucket/key level even
+                // though HTTP semantics say otherwise, so retrying a
+                // duplicate PUT is safe — it produces the same final
+                // object. Re-sign on every attempt.
+                let result = try await RetryRunner.run(
+                    policy: retryPolicy,
+                    logger: Self.logger
+                ) { _ -> UploadResult in
+                    try Task.checkCancellation()
 
-                // TODO: byte-level progress via URLSessionTaskDelegate.
-                let (responseBody, response) = try await transport.send(request, body: .data(data))
+                    let request = try Self.buildSignedPutRequest(
+                        bucket: bucket,
+                        key: key,
+                        configuration: configuration,
+                        payloadHash: payloadHash,
+                        contentLength: data.count,
+                        contentType: capturedOptions.contentType,
+                        cacheControl: capturedOptions.cacheControl,
+                        metadata: capturedOptions.metadata,
+                        acl: capturedOptions.acl,
+                        storageClass: capturedOptions.storageClass,
+                        serverSideEncryption: capturedOptions.serverSideEncryption,
+                        ifNoneMatch: capturedOptions.ifNoneMatch
+                    )
 
-                try Task.checkCancellation()
+                    try Task.checkCancellation()
 
-                let result = try Self.makeUploadResult(
-                    key: key,
-                    response: response,
-                    body: responseBody
-                )
+                    // TODO: byte-level progress via URLSessionTaskDelegate.
+                    let (responseBody, response) = try await transport.send(request, body: .data(data))
+
+                    try Task.checkCancellation()
+
+                    let built = try Self.makeUploadResult(
+                        key: key,
+                        response: response,
+                        body: responseBody
+                    )
+                    Self.logger.debug("uploadData finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
+                    return built
+                }
 
                 await state.yieldProgress(
                     TransferProgress(totalBytes: totalBytes, bytesTransferred: totalBytes)
                 )
                 await state.finish(with: result)
-                Self.logger.debug("uploadData finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
             } catch is CancellationError {
                 await state.cancel()
             } catch let urlError as URLError {
@@ -140,6 +155,7 @@ extension BucketClient {
 
         let configuration = self.configuration
         let transport = self.transport
+        let retryPolicy = self.retryPolicy
         let key = path.resolve()
 
         let work = Task {
@@ -158,6 +174,7 @@ extension BucketClient {
                         options: options,
                         configuration: configuration,
                         transport: transport,
+                        retryPolicy: retryPolicy,
                         state: state
                     )
                 } else {
@@ -169,6 +186,7 @@ extension BucketClient {
                         options: options,
                         configuration: configuration,
                         transport: transport,
+                        retryPolicy: retryPolicy,
                         state: state
                     )
                 }
@@ -204,6 +222,7 @@ extension BucketClient {
         options: UploadFileOptions,
         configuration: BucketConfiguration,
         transport: any HTTPTransport,
+        retryPolicy: RetryPolicy,
         state: TransferTaskState<UploadResult>
     ) async throws {
         try Task.checkCancellation()
@@ -213,33 +232,46 @@ extension BucketClient {
             TransferProgress(totalBytes: totalBytes, bytesTransferred: 0)
         )
 
-        let request = try Self.buildSignedPutRequest(
-            bucket: bucket,
-            key: key,
-            configuration: configuration,
-            payloadHash: CanonicalRequest.unsignedPayload,
-            contentLength: totalBytes.map(Int.init),
-            contentType: options.contentType,
-            cacheControl: options.cacheControl,
-            metadata: options.metadata,
-            acl: options.acl,
-            storageClass: options.storageClass,
-            serverSideEncryption: options.serverSideEncryption,
-            ifNoneMatch: options.ifNoneMatch
-        )
+        // S3 single-part PUT is idempotent at the bucket/key level —
+        // a duplicate PUT produces the same final object — so retry
+        // the dispatch on transient failures even though HTTP
+        // semantics consider PUT non-idempotent.
+        let result = try await RetryRunner.run(
+            policy: retryPolicy,
+            logger: Self.logger
+        ) { _ -> UploadResult in
+            try Task.checkCancellation()
 
-        try Task.checkCancellation()
+            let request = try Self.buildSignedPutRequest(
+                bucket: bucket,
+                key: key,
+                configuration: configuration,
+                payloadHash: CanonicalRequest.unsignedPayload,
+                contentLength: totalBytes.map(Int.init),
+                contentType: options.contentType,
+                cacheControl: options.cacheControl,
+                metadata: options.metadata,
+                acl: options.acl,
+                storageClass: options.storageClass,
+                serverSideEncryption: options.serverSideEncryption,
+                ifNoneMatch: options.ifNoneMatch
+            )
 
-        // TODO: byte-level progress via URLSessionTaskDelegate.
-        let (responseBody, response) = try await transport.upload(request, fromFile: local)
+            try Task.checkCancellation()
 
-        try Task.checkCancellation()
+            // TODO: byte-level progress via URLSessionTaskDelegate.
+            let (responseBody, response) = try await transport.upload(request, fromFile: local)
 
-        let result = try Self.makeUploadResult(
-            key: key,
-            response: response,
-            body: responseBody
-        )
+            try Task.checkCancellation()
+
+            let built = try Self.makeUploadResult(
+                key: key,
+                response: response,
+                body: responseBody
+            )
+            Self.logger.debug("uploadFile finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
+            return built
+        }
 
         await state.yieldProgress(
             TransferProgress(
@@ -248,7 +280,6 @@ extension BucketClient {
             )
         )
         await state.finish(with: result)
-        Self.logger.debug("uploadFile finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
     }
 
     /// Multipart auto-switching path. Initiates the upload, slices
@@ -267,6 +298,7 @@ extension BucketClient {
         options: UploadFileOptions,
         configuration: BucketConfiguration,
         transport: any HTTPTransport,
+        retryPolicy: RetryPolicy,
         state: TransferTaskState<UploadResult>
     ) async throws {
         try Task.checkCancellation()
@@ -284,11 +316,15 @@ extension BucketClient {
         )
 
         let initiateOptions = makeUploadDataOptions(from: options)
+        // Each multipart wire call (Initiate, UploadPart, Complete,
+        // Abort) is retried independently — a transient blip on part
+        // 47 should not restart the upload from part 1.
         let uploadID = try await MultipartInitiator.initiate(
             bucket: bucket,
             key: key,
             configuration: configuration,
             transport: transport,
+            retryPolicy: retryPolicy,
             options: initiateOptions
         )
 
@@ -298,7 +334,8 @@ extension BucketClient {
             bucket: bucket,
             key: key,
             uploadID: uploadID,
-            options: initiateOptions
+            options: initiateOptions,
+            retryPolicy: retryPolicy
         )
 
         do {

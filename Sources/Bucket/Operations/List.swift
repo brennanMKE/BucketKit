@@ -157,58 +157,66 @@ extension BucketClient {
         path: (any BucketPath)?,
         options: ListOptions
     ) async throws -> BucketListResult {
+        let effectivePrefix = options.prefix ?? path?.resolve()
+        let configuration = self.configuration
+        let transport = self.transport
+        let delimiter = options.delimiter
+        let maxKeys = options.maxKeys
+        let continuationToken = options.continuationToken
+
+        Self.listLogger.debug(
+            "list page bucket=\(bucket, privacy: .public) prefix=\(effectivePrefix ?? "-", privacy: .public) delimiter=\(delimiter ?? "-", privacy: .public) continuation=\(continuationToken != nil ? "yes" : "no", privacy: .public)"
+        )
+
         do {
-            try Task.checkCancellation()
+            return try await RetryRunner.run(policy: retryPolicy, logger: Self.listLogger) { _ in
+                try Task.checkCancellation()
 
-            let effectivePrefix = options.prefix ?? path?.resolve()
-            Self.listLogger.debug(
-                "list page bucket=\(bucket, privacy: .public) prefix=\(effectivePrefix ?? "-", privacy: .public) delimiter=\(options.delimiter ?? "-", privacy: .public) continuation=\(options.continuationToken != nil ? "yes" : "no", privacy: .public)"
-            )
+                let request = try Self.buildSignedListRequest(
+                    bucket: bucket,
+                    configuration: configuration,
+                    prefix: effectivePrefix,
+                    delimiter: delimiter,
+                    maxKeys: maxKeys,
+                    continuationToken: continuationToken
+                )
 
-            let request = try Self.buildSignedListRequest(
-                bucket: bucket,
-                configuration: configuration,
-                prefix: effectivePrefix,
-                delimiter: options.delimiter,
-                maxKeys: options.maxKeys,
-                continuationToken: options.continuationToken
-            )
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let (responseBody, response) = try await transport.send(request, body: nil)
 
-            let (responseBody, response) = try await transport.send(request, body: nil)
+                try Task.checkCancellation()
 
-            try Task.checkCancellation()
+                let status = response.statusCode
+                guard (200..<300).contains(status) else {
+                    throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+                }
 
-            let status = response.statusCode
-            guard (200..<300).contains(status) else {
-                throw BucketServiceError.decode(httpStatus: status, body: responseBody)
-            }
+                let decoded: ListBucketResultV2
+                do {
+                    decoded = try XMLDecoder.decode(ListBucketResultV2.self, from: responseBody)
+                } catch {
+                    throw BucketClientError.decodingFailed(String(describing: error))
+                }
 
-            let decoded: ListBucketResultV2
-            do {
-                decoded = try XMLDecoder.decode(ListBucketResultV2.self, from: responseBody)
-            } catch {
-                throw BucketClientError.decodingFailed(String(describing: error))
-            }
+                let items = decoded.contents.map { entry in
+                    BucketObject(
+                        key: entry.key,
+                        size: entry.size,
+                        lastModified: entry.lastModified,
+                        eTag: entry.eTag,
+                        storageClass: entry.storageClass.flatMap(StorageClass.init(rawValue:))
+                    )
+                }
+                let commonPrefixes = decoded.commonPrefixes.map { $0.prefix }
 
-            let items = decoded.contents.map { entry in
-                BucketObject(
-                    key: entry.key,
-                    size: entry.size,
-                    lastModified: entry.lastModified,
-                    eTag: entry.eTag,
-                    storageClass: entry.storageClass.flatMap(StorageClass.init(rawValue:))
+                return BucketListResult(
+                    items: items,
+                    commonPrefixes: commonPrefixes,
+                    isTruncated: decoded.isTruncated,
+                    nextContinuationToken: decoded.nextContinuationToken
                 )
             }
-            let commonPrefixes = decoded.commonPrefixes.map { $0.prefix }
-
-            return BucketListResult(
-                items: items,
-                commonPrefixes: commonPrefixes,
-                isTruncated: decoded.isTruncated,
-                nextContinuationToken: decoded.nextContinuationToken
-            )
         } catch is CancellationError {
             throw BucketClientError.cancelled
         } catch let urlError as URLError {

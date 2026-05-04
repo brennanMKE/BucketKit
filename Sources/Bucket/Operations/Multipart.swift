@@ -65,6 +65,12 @@ public actor MultipartUpload {
     /// the signer).
     private let initiateOptions: UploadDataOptions
 
+    /// Retry policy applied to UploadPart/Complete/Abort. Captured
+    /// from the parent ``BucketClient`` at construction so per-call
+    /// wire failures retry independently — a blip on part 47 does
+    /// not restart the upload from part 1.
+    private let retryPolicy: RetryPolicy
+
     /// Parts the actor has observed completing so far. Order is
     /// arbitrary; ``complete()`` sorts by ``UploadedPart/partNumber``
     /// before serializing the request body.
@@ -80,7 +86,8 @@ public actor MultipartUpload {
         bucket: String,
         key: String,
         uploadID: String,
-        options: UploadDataOptions
+        options: UploadDataOptions,
+        retryPolicy: RetryPolicy = .default
     ) {
         self.configuration = configuration
         self.transport = transport
@@ -88,6 +95,7 @@ public actor MultipartUpload {
         self.key = key
         self.uploadID = uploadID
         self.initiateOptions = options
+        self.retryPolicy = retryPolicy
     }
 
     // MARK: - Uploading parts
@@ -106,27 +114,47 @@ public actor MultipartUpload {
         try Self.validatePartNumber(partNumber)
 
         let payloadHash = CanonicalRequest.sha256Hex(data)
-        let request = try Self.buildSignedUploadPartRequest(
-            bucket: bucket,
-            key: key,
-            uploadID: uploadID,
-            partNumber: partNumber,
-            payloadHash: payloadHash,
-            contentLength: data.count,
-            configuration: configuration,
-            serverSideEncryption: initiateOptions.serverSideEncryption
-        )
+        let bucket = self.bucket
+        let key = self.key
+        let uploadID = self.uploadID
+        let configuration = self.configuration
+        let transport = self.transport
+        let sse = self.initiateOptions.serverSideEncryption
 
-        let (responseBody, response) = try await transport.send(request, body: .data(data))
-        let part = try Self.makeUploadedPart(
-            partNumber: partNumber,
-            response: response,
-            body: responseBody
-        )
+        // Per-part retry: re-sign on every attempt and re-issue the
+        // PUT. S3 treats UploadPart as idempotent on
+        // (uploadId, partNumber), so a duplicate part overwrites the
+        // earlier one with no harm.
+        let part = try await RetryRunner.run(
+            policy: retryPolicy,
+            logger: Self.logger
+        ) { _ -> UploadedPart in
+            try Task.checkCancellation()
+
+            let request = try Self.buildSignedUploadPartRequest(
+                bucket: bucket,
+                key: key,
+                uploadID: uploadID,
+                partNumber: partNumber,
+                payloadHash: payloadHash,
+                contentLength: data.count,
+                configuration: configuration,
+                serverSideEncryption: sse
+            )
+
+            let (responseBody, response) = try await transport.send(request, body: .data(data))
+            let built = try Self.makeUploadedPart(
+                partNumber: partNumber,
+                response: response,
+                body: responseBody
+            )
+            Self.logger.debug(
+                "uploadPart-completed key=\(key, privacy: .public) partNumber=\(partNumber, privacy: .public) status=\(response.statusCode, privacy: .public)"
+            )
+            return built
+        }
+
         parts.append(part)
-        Self.logger.debug(
-            "uploadPart-completed key=\(self.key, privacy: .public) partNumber=\(partNumber, privacy: .public) status=\(response.statusCode, privacy: .public)"
-        )
         return part
     }
 
@@ -147,27 +175,43 @@ public actor MultipartUpload {
             return size
         }()
 
-        let request = try Self.buildSignedUploadPartRequest(
-            bucket: bucket,
-            key: key,
-            uploadID: uploadID,
-            partNumber: partNumber,
-            payloadHash: CanonicalRequest.unsignedPayload,
-            contentLength: contentLength,
-            configuration: configuration,
-            serverSideEncryption: initiateOptions.serverSideEncryption
-        )
+        let bucket = self.bucket
+        let key = self.key
+        let uploadID = self.uploadID
+        let configuration = self.configuration
+        let transport = self.transport
+        let sse = self.initiateOptions.serverSideEncryption
 
-        let (responseBody, response) = try await transport.upload(request, fromFile: fileURL)
-        let part = try Self.makeUploadedPart(
-            partNumber: partNumber,
-            response: response,
-            body: responseBody
-        )
+        let part = try await RetryRunner.run(
+            policy: retryPolicy,
+            logger: Self.logger
+        ) { _ -> UploadedPart in
+            try Task.checkCancellation()
+
+            let request = try Self.buildSignedUploadPartRequest(
+                bucket: bucket,
+                key: key,
+                uploadID: uploadID,
+                partNumber: partNumber,
+                payloadHash: CanonicalRequest.unsignedPayload,
+                contentLength: contentLength,
+                configuration: configuration,
+                serverSideEncryption: sse
+            )
+
+            let (responseBody, response) = try await transport.upload(request, fromFile: fileURL)
+            let built = try Self.makeUploadedPart(
+                partNumber: partNumber,
+                response: response,
+                body: responseBody
+            )
+            Self.logger.debug(
+                "uploadPart-completed key=\(key, privacy: .public) partNumber=\(partNumber, privacy: .public) status=\(response.statusCode, privacy: .public)"
+            )
+            return built
+        }
+
         parts.append(part)
-        Self.logger.debug(
-            "uploadPart-completed key=\(self.key, privacy: .public) partNumber=\(partNumber, privacy: .public) status=\(response.statusCode, privacy: .public)"
-        )
         return part
     }
 
@@ -183,46 +227,64 @@ public actor MultipartUpload {
         let sorted = parts.sorted { $0.partNumber < $1.partNumber }
         let body = Self.makeCompleteMultipartBody(parts: sorted)
 
-        let request = try Self.buildSignedCompleteRequest(
-            bucket: bucket,
-            key: key,
-            uploadID: uploadID,
-            body: body,
-            configuration: configuration
-        )
+        let bucket = self.bucket
+        let key = self.key
+        let uploadID = self.uploadID
+        let configuration = self.configuration
+        let transport = self.transport
+        let sortedCount = sorted.count
 
-        let (responseBody, response) = try await transport.send(request, body: .data(body))
-        let status = response.statusCode
-        guard (200..<300).contains(status) else {
-            throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+        // CompleteMultipartUpload is idempotent on (uploadId, partList)
+        // — duplicate completes against the same already-completed
+        // upload return the same result, so retrying transient
+        // failures is safe.
+        return try await RetryRunner.run(
+            policy: retryPolicy,
+            logger: Self.logger
+        ) { _ -> UploadResult in
+            try Task.checkCancellation()
+
+            let request = try Self.buildSignedCompleteRequest(
+                bucket: bucket,
+                key: key,
+                uploadID: uploadID,
+                body: body,
+                configuration: configuration
+            )
+
+            let (responseBody, response) = try await transport.send(request, body: .data(body))
+            let status = response.statusCode
+            guard (200..<300).contains(status) else {
+                throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+            }
+
+            let decoded: CompleteMultipartUploadResult
+            do {
+                decoded = try XMLDecoder.decode(CompleteMultipartUploadResult.self, from: responseBody)
+            } catch {
+                throw BucketClientError.decodingFailed(String(describing: error))
+            }
+
+            // Strip the surrounding quotes S3 wraps around the ETag in
+            // its XML response so the public ``UploadResult`` matches
+            // the convention used elsewhere in the package.
+            let trimmed: String = {
+                var v = decoded.eTag
+                if v.hasPrefix("\"") { v.removeFirst() }
+                if v.hasSuffix("\"") { v.removeLast() }
+                return v
+            }()
+
+            Self.logger.debug(
+                "complete key=\(key, privacy: .public) status=\(status, privacy: .public) parts=\(sortedCount, privacy: .public)"
+            )
+
+            return UploadResult(
+                key: decoded.key,
+                eTag: trimmed,
+                versionID: decoded.versionID
+            )
         }
-
-        let decoded: CompleteMultipartUploadResult
-        do {
-            decoded = try XMLDecoder.decode(CompleteMultipartUploadResult.self, from: responseBody)
-        } catch {
-            throw BucketClientError.decodingFailed(String(describing: error))
-        }
-
-        // Strip the surrounding quotes S3 wraps around the ETag in
-        // its XML response so the public ``UploadResult`` matches
-        // the convention used elsewhere in the package.
-        let trimmed: String = {
-            var v = decoded.eTag
-            if v.hasPrefix("\"") { v.removeFirst() }
-            if v.hasSuffix("\"") { v.removeLast() }
-            return v
-        }()
-
-        Self.logger.debug(
-            "complete key=\(self.key, privacy: .public) status=\(status, privacy: .public) parts=\(sorted.count, privacy: .public)"
-        )
-
-        return UploadResult(
-            key: decoded.key,
-            eTag: trimmed,
-            versionID: decoded.versionID
-        )
     }
 
     /// Issues `AbortMultipartUpload`. Best effort — any error from
@@ -446,37 +508,52 @@ enum MultipartInitiator {
 
     /// Issues `POST /<key>?uploads`, decodes the response, and returns
     /// the `UploadId`.
+    ///
+    /// `Initiate` is technically non-idempotent — a duplicate request
+    /// allocates a fresh `UploadId` and orphans the previous one — but
+    /// retrying transient failures is still preferable to bubbling a
+    /// 503 up to the caller. The orphaned upload IDs are cleaned up
+    /// by S3's lifecycle (or the caller's bucket policy) within a few
+    /// days.
     static func initiate(
         bucket: String,
         key: String,
         configuration: BucketConfiguration,
         transport: any HTTPTransport,
+        retryPolicy: RetryPolicy = .default,
         options: UploadDataOptions
     ) async throws -> String {
-        let request = try buildSignedInitiateRequest(
-            bucket: bucket,
-            key: key,
-            configuration: configuration,
-            options: options
-        )
+        return try await RetryRunner.run(
+            policy: retryPolicy,
+            logger: Self.logger
+        ) { _ -> String in
+            try Task.checkCancellation()
 
-        let (responseBody, response) = try await transport.send(request, body: nil)
-        let status = response.statusCode
-        guard (200..<300).contains(status) else {
-            throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+            let request = try buildSignedInitiateRequest(
+                bucket: bucket,
+                key: key,
+                configuration: configuration,
+                options: options
+            )
+
+            let (responseBody, response) = try await transport.send(request, body: nil)
+            let status = response.statusCode
+            guard (200..<300).contains(status) else {
+                throw BucketServiceError.decode(httpStatus: status, body: responseBody)
+            }
+
+            let decoded: InitiateMultipartUploadResult
+            do {
+                decoded = try XMLDecoder.decode(InitiateMultipartUploadResult.self, from: responseBody)
+            } catch {
+                throw BucketClientError.decodingFailed(String(describing: error))
+            }
+
+            Self.logger.debug(
+                "initiate key=\(key, privacy: .public) status=\(status, privacy: .public)"
+            )
+            return decoded.uploadID
         }
-
-        let decoded: InitiateMultipartUploadResult
-        do {
-            decoded = try XMLDecoder.decode(InitiateMultipartUploadResult.self, from: responseBody)
-        } catch {
-            throw BucketClientError.decodingFailed(String(describing: error))
-        }
-
-        Self.logger.debug(
-            "initiate key=\(key, privacy: .public) status=\(status, privacy: .public)"
-        )
-        return decoded.uploadID
     }
 
     /// Builds the signed `URLRequest` for `POST /<key>?uploads`. The
@@ -636,6 +713,7 @@ extension BucketClient {
             key: key,
             configuration: configuration,
             transport: transport,
+            retryPolicy: retryPolicy,
             options: options
         )
         return MultipartUpload(
@@ -644,7 +722,8 @@ extension BucketClient {
             bucket: bucket,
             key: key,
             uploadID: uploadID,
-            options: options
+            options: options,
+            retryPolicy: retryPolicy
         )
     }
 }
