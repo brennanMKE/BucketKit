@@ -1,6 +1,5 @@
 import Foundation
 import CryptoKit
-import os
 
 extension BucketClient {
     /// Uploads an in-memory `Data` payload to `bucket` at the key the
@@ -44,7 +43,7 @@ extension BucketClient {
             do {
                 try Task.checkCancellation()
 
-                Self.logger.debug("uploadData start key=\(key, privacy: .public) bytes=\(totalBytes, privacy: .public)")
+                BucketLog.client.debug("uploadData start key=\(key, privacy: .private) bytes=\(totalBytes, privacy: .public)")
                 await state.yieldProgress(
                     TransferProgress(totalBytes: totalBytes, bytesTransferred: 0)
                 )
@@ -57,7 +56,7 @@ extension BucketClient {
                 // object. Re-sign on every attempt.
                 let result = try await RetryRunner.run(
                     policy: retryPolicy,
-                    logger: Self.logger
+                    logger: BucketLog.client
                 ) { _ -> UploadResult in
                     try Task.checkCancellation()
 
@@ -88,7 +87,7 @@ extension BucketClient {
                         response: response,
                         body: responseBody
                     )
-                    Self.logger.debug("uploadData finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
+                    BucketLog.client.debug("uploadData finish key=\(key, privacy: .private) status=\(response.statusCode, privacy: .public)")
                     return built
                 }
 
@@ -227,7 +226,7 @@ extension BucketClient {
     ) async throws {
         try Task.checkCancellation()
 
-        Self.logger.debug("uploadFile start key=\(key, privacy: .public) bytes=\(totalBytes ?? -1, privacy: .public)")
+        BucketLog.client.debug("uploadFile start key=\(key, privacy: .private) bytes=\(totalBytes ?? -1, privacy: .public)")
         await state.yieldProgress(
             TransferProgress(totalBytes: totalBytes, bytesTransferred: 0)
         )
@@ -238,7 +237,7 @@ extension BucketClient {
         // semantics consider PUT non-idempotent.
         let result = try await RetryRunner.run(
             policy: retryPolicy,
-            logger: Self.logger
+            logger: BucketLog.client
         ) { _ -> UploadResult in
             try Task.checkCancellation()
 
@@ -269,7 +268,7 @@ extension BucketClient {
                 response: response,
                 body: responseBody
             )
-            Self.logger.debug("uploadFile finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
+            BucketLog.client.debug("uploadFile finish key=\(key, privacy: .private) status=\(response.statusCode, privacy: .public)")
             return built
         }
 
@@ -307,8 +306,8 @@ extension BucketClient {
         let totalParts = Int((fileSize + Int64(partSize) - 1) / Int64(partSize))
         let concurrency = max(1, options.concurrency ?? defaultMultipartConcurrency)
 
-        Self.multipartLogger.debug(
-            "uploadFile-multipart start key=\(key, privacy: .public) bytes=\(fileSize, privacy: .public) parts=\(totalParts, privacy: .public) partSize=\(partSize, privacy: .public) concurrency=\(concurrency, privacy: .public)"
+        BucketLog.multipart.debug(
+            "uploadFile-multipart start key=\(key, privacy: .private) bytes=\(fileSize, privacy: .public) parts=\(totalParts, privacy: .public) partSize=\(partSize, privacy: .public) concurrency=\(concurrency, privacy: .public)"
         )
 
         await state.yieldProgress(
@@ -402,8 +401,8 @@ extension BucketClient {
                 TransferProgress(totalBytes: fileSize, bytesTransferred: fileSize)
             )
             await state.finish(with: result)
-            Self.multipartLogger.debug(
-                "uploadFile-multipart finish key=\(key, privacy: .public) parts=\(totalParts, privacy: .public)"
+            BucketLog.multipart.debug(
+                "uploadFile-multipart finish key=\(key, privacy: .private) parts=\(totalParts, privacy: .public)"
             )
         } catch is CancellationError {
             try? await upload.abort()
@@ -460,16 +459,6 @@ extension BucketClient {
     }
 
     // MARK: - Internals
-
-    private static let logger = Logger(
-        subsystem: "dev.brennanmke.bucket",
-        category: "client"
-    )
-
-    private static let multipartLogger = Logger(
-        subsystem: "dev.brennanmke.bucket",
-        category: "multipart"
-    )
 
     /// Builds the signed `URLRequest` for a `PUT` against `bucket`/`key`.
     ///

@@ -1,6 +1,5 @@
 import Foundation
 import CryptoKit
-import os
 
 // MARK: - MultipartUpload actor
 
@@ -35,11 +34,6 @@ import os
 /// responsibility. The auto-switching path in `uploadFile` enforces
 /// the floor itself when slicing the file into parts.
 public actor MultipartUpload {
-
-    private static let logger = Logger(
-        subsystem: "dev.brennanmke.bucket",
-        category: "multipart"
-    )
 
     /// Bucket the upload targets.
     public nonisolated let bucket: String
@@ -127,7 +121,7 @@ public actor MultipartUpload {
         // earlier one with no harm.
         let part = try await RetryRunner.run(
             policy: retryPolicy,
-            logger: Self.logger
+            logger: BucketLog.multipart
         ) { _ -> UploadedPart in
             try Task.checkCancellation()
 
@@ -148,8 +142,10 @@ public actor MultipartUpload {
                 response: response,
                 body: responseBody
             )
-            Self.logger.debug(
-                "uploadPart-completed key=\(key, privacy: .public) partNumber=\(partNumber, privacy: .public) status=\(response.statusCode, privacy: .public)"
+            // The object key may carry user-identifying paths — keep
+            // it `.private`. The uploadID is intentionally absent.
+            BucketLog.multipart.debug(
+                "uploadPart-completed key=\(key, privacy: .private) partNumber=\(partNumber, privacy: .public) status=\(response.statusCode, privacy: .public)"
             )
             return built
         }
@@ -184,7 +180,7 @@ public actor MultipartUpload {
 
         let part = try await RetryRunner.run(
             policy: retryPolicy,
-            logger: Self.logger
+            logger: BucketLog.multipart
         ) { _ -> UploadedPart in
             try Task.checkCancellation()
 
@@ -205,8 +201,8 @@ public actor MultipartUpload {
                 response: response,
                 body: responseBody
             )
-            Self.logger.debug(
-                "uploadPart-completed key=\(key, privacy: .public) partNumber=\(partNumber, privacy: .public) status=\(response.statusCode, privacy: .public)"
+            BucketLog.multipart.debug(
+                "uploadPart-completed key=\(key, privacy: .private) partNumber=\(partNumber, privacy: .public) status=\(response.statusCode, privacy: .public)"
             )
             return built
         }
@@ -240,7 +236,7 @@ public actor MultipartUpload {
         // failures is safe.
         return try await RetryRunner.run(
             policy: retryPolicy,
-            logger: Self.logger
+            logger: BucketLog.multipart
         ) { _ -> UploadResult in
             try Task.checkCancellation()
 
@@ -275,8 +271,8 @@ public actor MultipartUpload {
                 return v
             }()
 
-            Self.logger.debug(
-                "complete key=\(key, privacy: .public) status=\(status, privacy: .public) parts=\(sortedCount, privacy: .public)"
+            BucketLog.multipart.debug(
+                "complete key=\(key, privacy: .private) status=\(status, privacy: .public) parts=\(sortedCount, privacy: .public)"
             )
 
             return UploadResult(
@@ -300,16 +296,16 @@ public actor MultipartUpload {
                 configuration: configuration
             )
             let (_, response) = try await transport.send(request, body: nil)
-            Self.logger.debug(
-                "abort key=\(self.key, privacy: .public) status=\(response.statusCode, privacy: .public)"
+            BucketLog.multipart.debug(
+                "abort key=\(self.key, privacy: .private) status=\(response.statusCode, privacy: .public)"
             )
         } catch {
             // Best effort: cleanup failures are common (already
             // aborted, network gone, etc.). Log and swallow so
             // callers chaining `try? await abort()` after another
             // failure don't lose the original error.
-            Self.logger.debug(
-                "abort failed key=\(self.key, privacy: .public) error=\(String(describing: error), privacy: .public)"
+            BucketLog.multipart.debug(
+                "abort failed key=\(self.key, privacy: .private) error=\(String(describing: error), privacy: .public)"
             )
         }
     }
@@ -501,11 +497,6 @@ public actor MultipartUpload {
 /// `CreateMultipartUpload` request and parse the same response.
 enum MultipartInitiator {
 
-    private static let logger = Logger(
-        subsystem: "dev.brennanmke.bucket",
-        category: "multipart"
-    )
-
     /// Issues `POST /<key>?uploads`, decodes the response, and returns
     /// the `UploadId`.
     ///
@@ -525,7 +516,7 @@ enum MultipartInitiator {
     ) async throws -> String {
         return try await RetryRunner.run(
             policy: retryPolicy,
-            logger: Self.logger
+            logger: BucketLog.multipart
         ) { _ -> String in
             try Task.checkCancellation()
 
@@ -549,8 +540,12 @@ enum MultipartInitiator {
                 throw BucketClientError.decodingFailed(String(describing: error))
             }
 
-            Self.logger.debug(
-                "initiate key=\(key, privacy: .public) status=\(status, privacy: .public)"
+            // Never log the returned uploadID — treat it as opaque
+            // per the type-level note on ``MultipartUpload``. Key is
+            // marked `.private` so user-identifying paths don't end
+            // up in unified logging at the host level.
+            BucketLog.multipart.debug(
+                "initiate key=\(key, privacy: .private) status=\(status, privacy: .public)"
             )
             return decoded.uploadID
         }

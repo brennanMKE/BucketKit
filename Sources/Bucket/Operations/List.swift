@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 extension BucketClient {
     /// Lists objects in `bucket` using `ListObjectsV2`.
@@ -141,11 +140,6 @@ extension BucketClient {
 
     // MARK: - Internals
 
-    private static let listLogger = Logger(
-        subsystem: "dev.brennanmke.bucket",
-        category: "client"
-    )
-
     /// Fetches one page of `ListObjectsV2` results, mapping the
     /// decoded XML to a ``BucketListResult``.
     ///
@@ -164,12 +158,12 @@ extension BucketClient {
         let maxKeys = options.maxKeys
         let continuationToken = options.continuationToken
 
-        Self.listLogger.debug(
-            "list page bucket=\(bucket, privacy: .public) prefix=\(effectivePrefix ?? "-", privacy: .public) delimiter=\(delimiter ?? "-", privacy: .public) continuation=\(continuationToken != nil ? "yes" : "no", privacy: .public)"
+        BucketLog.client.debug(
+            "list page bucket=\(bucket, privacy: .public) prefix=\(effectivePrefix ?? "-", privacy: .private) delimiter=\(delimiter ?? "-", privacy: .public) continuation=\(continuationToken != nil ? "yes" : "no", privacy: .public)"
         )
 
         do {
-            return try await RetryRunner.run(policy: retryPolicy, logger: Self.listLogger) { _ in
+            return try await RetryRunner.run(policy: retryPolicy, logger: BucketLog.client) { _ in
                 try Task.checkCancellation()
 
                 let request = try Self.buildSignedListRequest(

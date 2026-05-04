@@ -1,6 +1,5 @@
 import Foundation
 import CryptoKit
-import os
 
 extension BucketClient {
     /// Downloads an object's bytes into memory.
@@ -40,14 +39,14 @@ extension BucketClient {
             do {
                 try Task.checkCancellation()
 
-                Self.downloadLogger.debug("downloadData start key=\(key, privacy: .public)")
+                BucketLog.client.debug("downloadData start key=\(key, privacy: .private)")
                 await state.yieldProgress(
                     TransferProgress(totalBytes: nil, bytesTransferred: 0)
                 )
 
                 let (data, response) = try await RetryRunner.run(
                     policy: retryPolicy,
-                    logger: Self.downloadLogger
+                    logger: BucketLog.client
                 ) { _ -> (Data, HTTPURLResponse) in
                     try Task.checkCancellation()
 
@@ -85,7 +84,7 @@ extension BucketClient {
                     )
                 )
                 await state.finish(with: data)
-                Self.downloadLogger.debug("downloadData finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
+                BucketLog.client.debug("downloadData finish key=\(key, privacy: .private) status=\(response.statusCode, privacy: .public)")
             } catch is CancellationError {
                 await state.cancel()
             } catch let urlError as URLError {
@@ -149,14 +148,14 @@ extension BucketClient {
             do {
                 try Task.checkCancellation()
 
-                Self.downloadLogger.debug("downloadFile start key=\(key, privacy: .public)")
+                BucketLog.client.debug("downloadFile start key=\(key, privacy: .private)")
                 await state.yieldProgress(
                     TransferProgress(totalBytes: nil, bytesTransferred: 0)
                 )
 
                 let response = try await RetryRunner.run(
                     policy: retryPolicy,
-                    logger: Self.downloadLogger
+                    logger: BucketLog.client
                 ) { _ -> HTTPURLResponse in
                     try Task.checkCancellation()
 
@@ -188,7 +187,7 @@ extension BucketClient {
                     )
                 )
                 await state.finish(with: local)
-                Self.downloadLogger.debug("downloadFile finish key=\(key, privacy: .public) status=\(response.statusCode, privacy: .public)")
+                BucketLog.client.debug("downloadFile finish key=\(key, privacy: .private) status=\(response.statusCode, privacy: .public)")
             } catch is CancellationError {
                 await state.cancel()
             } catch let urlError as URLError {
@@ -210,11 +209,6 @@ extension BucketClient {
     }
 
     // MARK: - Internals
-
-    private static let downloadLogger = Logger(
-        subsystem: "dev.brennanmke.bucket",
-        category: "client"
-    )
 
     /// Builds the signed `URLRequest` for a `GET` against `bucket`/`key`.
     ///

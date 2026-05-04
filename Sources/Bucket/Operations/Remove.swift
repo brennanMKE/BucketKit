@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 extension BucketClient {
     /// Deletes an object at the key the supplied path resolves to.
@@ -31,10 +30,10 @@ extension BucketClient {
         let transport = self.transport
         let versionID = options.versionID
 
-        Self.removeLogger.debug("remove start key=\(key, privacy: .public) versionID=\(versionID ?? "-", privacy: .public)")
+        BucketLog.client.debug("remove start key=\(key, privacy: .private) versionID=\(versionID ?? "-", privacy: .private)")
 
         do {
-            return try await RetryRunner.run(policy: retryPolicy, logger: Self.removeLogger) { _ in
+            return try await RetryRunner.run(policy: retryPolicy, logger: BucketLog.client) { _ in
                 try Task.checkCancellation()
 
                 // Re-sign on every attempt: `X-Amz-Date` differs per
@@ -58,7 +57,7 @@ extension BucketClient {
                     throw BucketServiceError.decode(httpStatus: status, body: responseBody)
                 }
 
-                Self.removeLogger.debug("remove finish key=\(key, privacy: .public) status=\(status, privacy: .public)")
+                BucketLog.client.debug("remove finish key=\(key, privacy: .private) status=\(status, privacy: .public)")
                 return key
             }
         } catch is CancellationError {
@@ -89,10 +88,10 @@ extension BucketClient {
         let configuration = self.configuration
         let transport = self.transport
 
-        Self.removeLogger.debug("headObject start key=\(key, privacy: .public)")
+        BucketLog.client.debug("headObject start key=\(key, privacy: .private)")
 
         do {
-            return try await RetryRunner.run(policy: retryPolicy, logger: Self.removeLogger) { _ in
+            return try await RetryRunner.run(policy: retryPolicy, logger: BucketLog.client) { _ in
                 try Task.checkCancellation()
 
                 let request = try Self.buildSignedHeadRequest(
@@ -116,7 +115,7 @@ extension BucketClient {
                 }
 
                 let metadata = Self.makeObjectMetadata(key: key, response: response)
-                Self.removeLogger.debug("headObject finish key=\(key, privacy: .public) status=\(status, privacy: .public)")
+                BucketLog.client.debug("headObject finish key=\(key, privacy: .private) status=\(status, privacy: .public)")
                 return metadata
             }
         } catch is CancellationError {
@@ -127,11 +126,6 @@ extension BucketClient {
     }
 
     // MARK: - Internals
-
-    private static let removeLogger = Logger(
-        subsystem: "dev.brennanmke.bucket",
-        category: "client"
-    )
 
     /// Builds the signed `URLRequest` for a `DELETE` against
     /// `bucket`/`key`.

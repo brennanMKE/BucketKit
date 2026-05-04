@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 extension BucketClient {
     /// Returns a presigned URL for a single S3 operation against
@@ -45,7 +44,7 @@ extension BucketClient {
         // its query string carries the credential and signature once
         // signed, and even the unsigned form leaks the bucket/key.
         // Length stands in for a privacy-safe fingerprint.
-        Self.logger.debug(
+        BucketLog.signing.debug(
             "getURL method=\(options.method.rawValue, privacy: .public) bucket=\(bucket, privacy: .public) keyLen=\(key.count, privacy: .public)"
         )
 
@@ -72,11 +71,6 @@ extension BucketClient {
     }
 
     // MARK: - Internals
-
-    private static let logger = Logger(
-        subsystem: "dev.brennanmke.bucket",
-        category: "signing"
-    )
 
     /// Constructs the base URL used as input to ``PresignedURL/sign(...)``.
     ///

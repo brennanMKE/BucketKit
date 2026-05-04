@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 /// Produces SigV4 `Authorization` headers (and the supporting
 /// `x-amz-*` headers) for an in-memory request representation.
@@ -25,11 +24,6 @@ struct SigV4Signer: Sendable {
     /// vectors (#0007) can pin a specific signing time. The default
     /// captures `Date()` on each call.
     private let clock: @Sendable () -> Date
-
-    private static let logger = Logger(
-        subsystem: "dev.brennanmke.bucket",
-        category: "signing"
-    )
 
     /// Credential triple. Kept as a separate value so callers that
     /// already split credentials out of `BucketConfiguration` do not
@@ -199,10 +193,12 @@ struct SigV4Signer: Sendable {
             "SignedHeaders=\(signedHeaderList), " +
             "Signature=\(signature)"
 
-        // Never log the Authorization value, credentials, or session
-        // tokens. Logging the signed-header list is safe and helpful
-        // for diagnosing SignatureDoesNotMatch.
-        Self.logger.debug("Signed \(request.method, privacy: .public) request; signed-headers=\(signedHeaderList, privacy: .public)")
+        // Never log the Authorization value, credentials, session
+        // tokens, or the request URL (which carries bucket/key and
+        // for presigned requests would carry the signature itself).
+        // Logging the method and the signed-header list is safe and
+        // helpful for diagnosing SignatureDoesNotMatch.
+        BucketLog.signing.debug("Signed \(request.method, privacy: .public) request; signed-headers=\(signedHeaderList, privacy: .public)")
 
         var output = headers.dictionary
         output["Authorization"] = authorization

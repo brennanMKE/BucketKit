@@ -1,5 +1,4 @@
 import Foundation
-import os
 
 extension BucketClient {
     /// Lists every bucket the configured credentials own (or have
@@ -24,10 +23,10 @@ extension BucketClient {
         let configuration = self.configuration
         let transport = self.transport
 
-        Self.bucketsLogger.debug("listBuckets start")
+        BucketLog.client.debug("listBuckets start")
 
         do {
-            return try await RetryRunner.run(policy: retryPolicy, logger: Self.bucketsLogger) { _ in
+            return try await RetryRunner.run(policy: retryPolicy, logger: BucketLog.client) { _ in
                 try Task.checkCancellation()
 
                 let request = try Self.buildSignedListBucketsRequest(
@@ -56,7 +55,7 @@ extension BucketClient {
                     BucketInfo(name: entry.name, creationDate: entry.creationDate)
                 }
 
-                Self.bucketsLogger.debug("listBuckets finish status=\(status, privacy: .public) count=\(buckets.count, privacy: .public)")
+                BucketLog.client.debug("listBuckets finish status=\(status, privacy: .public) count=\(buckets.count, privacy: .public)")
                 return buckets
             }
         } catch is CancellationError {
@@ -106,7 +105,7 @@ extension BucketClient {
         let configuration = self.configuration
         let transport = self.transport
 
-        Self.bucketsLogger.debug(
+        BucketLog.client.debug(
             "createBucket start bucket=\(name, privacy: .public) locationConstraint=\(locationConstraint ?? "-", privacy: .public)"
         )
 
@@ -125,7 +124,7 @@ extension BucketClient {
         }()
 
         do {
-            try await RetryRunner.run(policy: retryPolicy, logger: Self.bucketsLogger) { _ in
+            try await RetryRunner.run(policy: retryPolicy, logger: BucketLog.client) { _ in
                 try Task.checkCancellation()
 
                 let request = try Self.buildSignedBucketRequest(
@@ -147,7 +146,7 @@ extension BucketClient {
                     throw BucketServiceError.decode(httpStatus: status, body: responseBody)
                 }
 
-                Self.bucketsLogger.debug(
+                BucketLog.client.debug(
                     "createBucket finish bucket=\(name, privacy: .public) status=\(status, privacy: .public)"
                 )
             }
@@ -172,10 +171,10 @@ extension BucketClient {
         let configuration = self.configuration
         let transport = self.transport
 
-        Self.bucketsLogger.debug("deleteBucket start bucket=\(name, privacy: .public)")
+        BucketLog.client.debug("deleteBucket start bucket=\(name, privacy: .public)")
 
         do {
-            try await RetryRunner.run(policy: retryPolicy, logger: Self.bucketsLogger) { _ in
+            try await RetryRunner.run(policy: retryPolicy, logger: BucketLog.client) { _ in
                 try Task.checkCancellation()
 
                 let request = try Self.buildSignedBucketRequest(
@@ -196,7 +195,7 @@ extension BucketClient {
                     throw BucketServiceError.decode(httpStatus: status, body: responseBody)
                 }
 
-                Self.bucketsLogger.debug(
+                BucketLog.client.debug(
                     "deleteBucket finish bucket=\(name, privacy: .public) status=\(status, privacy: .public)"
                 )
             }
@@ -225,10 +224,10 @@ extension BucketClient {
         let configuration = self.configuration
         let transport = self.transport
 
-        Self.bucketsLogger.debug("headBucket start bucket=\(name, privacy: .public)")
+        BucketLog.client.debug("headBucket start bucket=\(name, privacy: .public)")
 
         do {
-            return try await RetryRunner.run(policy: retryPolicy, logger: Self.bucketsLogger) { _ in
+            return try await RetryRunner.run(policy: retryPolicy, logger: BucketLog.client) { _ in
                 try Task.checkCancellation()
 
                 let request = try Self.buildSignedBucketRequest(
@@ -257,7 +256,7 @@ extension BucketClient {
 
                 let region = Self.firstHeader(named: "x-amz-bucket-region", in: response)
 
-                Self.bucketsLogger.debug(
+                BucketLog.client.debug(
                     "headBucket finish bucket=\(name, privacy: .public) status=\(status, privacy: .public) region=\(region ?? "-", privacy: .public)"
                 )
                 return BucketMetadata(region: region)
@@ -270,11 +269,6 @@ extension BucketClient {
     }
 
     // MARK: - Internals
-
-    private static let bucketsLogger = Logger(
-        subsystem: "dev.brennanmke.bucket",
-        category: "client"
-    )
 
     /// Builds the signed `URLRequest` for `GET /` against the service
     /// endpoint.
