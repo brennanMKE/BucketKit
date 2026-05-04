@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import Combine
 import Bucket
 
 /// Provider presets the UI exposes. The "custom" entry is for MinIO
