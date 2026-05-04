@@ -29,6 +29,17 @@ let package = Package(
             name: "BucketTests",
             dependencies: ["Bucket"]
         ),
+        // Integration tests against a local MinIO running on
+        // http://localhost:9000 (see scripts/minio-up.sh). Each test
+        // skips with a `[skip]` log line when MinIO is unreachable, so
+        // this target is safe to include in the default `swift test`
+        // run. Filter with `swift test --filter BucketIntegrationTests`
+        // to run only this target.
+        .testTarget(
+            name: "BucketIntegrationTests",
+            dependencies: ["Bucket"],
+            path: "Tests/BucketIntegrationTests"
+        ),
     ],
     swiftLanguageModes: [.v6]
 )

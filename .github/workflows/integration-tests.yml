@@ -1,0 +1,65 @@
+# Integration tests against a Docker-managed MinIO.
+#
+# TODO: revisit runner choice once Apple Silicon GA runners support Docker.
+# GitHub-hosted macOS runners do not include Docker today, so we run on
+# `ubuntu-latest` and rely on the Linux toolchain's Foundation / CryptoKit
+# polyfills. BucketKit itself is Apple-only at runtime; this job validates
+# the public surface against MinIO via the test target only.
+
+name: Integration tests
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  minio:
+    runs-on: ubuntu-latest
+
+    services:
+      minio:
+        image: minio/minio:latest
+        ports:
+          - 9000:9000
+          - 9001:9001
+        env:
+          MINIO_ROOT_USER: minioadmin
+          MINIO_ROOT_PASSWORD: minioadmin
+        # `services` does not honour custom commands, so we rely on the
+        # default MinIO server entrypoint and pass --console-address via
+        # an explicit `docker run` step below if we ever need it.
+        options: >-
+          --health-cmd "curl -fsS http://localhost:9000/minio/health/ready"
+          --health-interval 5s
+          --health-timeout 2s
+          --health-retries 12
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Swift toolchain
+        uses: swift-actions/setup-swift@v2
+        with:
+          swift-version: "6.0"
+
+      - name: Wait for MinIO health
+        run: |
+          for i in $(seq 1 30); do
+            if curl -fsS http://localhost:9000/minio/health/ready; then
+              echo "MinIO ready"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "MinIO did not become ready" >&2
+          exit 1
+
+      - name: Run integration tests
+        env:
+          BUCKETKIT_MINIO_ENDPOINT: http://localhost:9000
+          BUCKETKIT_MINIO_ACCESS_KEY: minioadmin
+          BUCKETKIT_MINIO_SECRET_KEY: minioadmin
+        run: swift test --filter BucketIntegrationTests
